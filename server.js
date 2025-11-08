@@ -1,22 +1,46 @@
-// server.js
-/**
- * Winchester Heart Centre – PBX/AI Backend with Google Calendar integration
- * - Loads Google service account from env (GOOGLE_CREDENTIALS_B64 or GOOGLE_APPLICATION_CREDENTIALS_JSON)
- * - Physicians → calendarId map (edit below if needed)
- * - Endpoints:
- *    GET  /health
- *    POST /calendar/create
- *    GET  /calendar/upcoming/:physician?max=10
- *    POST /calendar/delete
- *    POST /retell/action   (example workflow)
- */
+// server.js — WHC PBX + Calendar (Retell + Telnyx + Email)
+// ---------------------------------------------------------
 
 import express from "express";
 import cors from "cors";
 import { google } from "googleapis";
+import axios from "axios";
+import nodemailer from "nodemailer";
 
-// -------------------------- Config Maps ------------------------------
-// Physicians → Google Calendar IDs (EDIT THESE IF NEEDED)
+// -------------------------- App --------------------------
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: "2mb" }));
+
+app.get("/health", (_req, res) => res.status(200).send("ok"));
+
+// Simple req log
+app.use((req, _res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
+  next();
+});
+
+// -------------------------- Config -----------------------
+const HANDOFF_TIMEOUT_MS = Number(process.env.HANDOFF_TIMEOUT_MS || 25000);
+const MOH_URL = process.env.MOH_URL || "https://example.com/moh.mp3";
+
+const BRANCH_NUMBERS = {
+  winchester: process.env.BRANCH_WINCHESTER || "+18769082658",
+  portmore: process.env.BRANCH_PORTMORE || "+18767042739",
+  ardenne: process.env.BRANCH_ARDENNE || "+18766713825",
+  sav: process.env.BRANCH_SAV || "+18769540252",
+};
+
+const BRANCH_EMAILS = {
+  winchester: process.env.EMAIL_WINCHESTER || "winchester@winchesterheartcentre.com",
+  portmore: process.env.EMAIL_PORTMORE || "portmore@winchesterheartcentre.com",
+  ardenne: process.env.EMAIL_ARDENNE || "ardenne@winchesterheartcentre.com",
+  sav: process.env.EMAIL_SAV || "savlamar@winchesterheartcentre.com",
+};
+
+const FROM_EMAIL = process.env.FROM_EMAIL || "Winchester Heart Centre <no-reply@whc.local>";
+
+// Physician calendars
 const PHYSICIANS = {
   dr_emery:
     "uh7ehq6qg5c1qfdciic3v8l0s8@group.calendar.google.com",
@@ -34,7 +58,6 @@ const PHYSICIANS = {
     "ed382c812be7a6d3396a874ca19368f2d321805f80526e6f3224f713f0637cee@group.calendar.google.com",
 };
 
-// Optional “display” names (used only in friendly responses)
 const PHYSICIAN_DISPLAY = {
   dr_emery: "Dr Emery",
   dr_thompson: "Dr Thompson",
@@ -45,40 +68,22 @@ const PHYSICIAN_DISPLAY = {
   dr_dixon: "Dr Dixon",
 };
 
-// -------------------------- Google Calendar Helper -------------------
+// ---------------------- Google Calendar ------------------
 function loadServiceAccountJSON() {
-  // Prefer base64 JSON (Railway variable GOOGLE_CREDENTIALS_B64).
   const b64 = process.env.GOOGLE_CREDENTIALS_B64;
   const inline = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
-
-  if (b64) {
-    try {
-      const decoded = Buffer.from(b64, "base64").toString("utf8");
-      const json = JSON.parse(decoded);
-      console.log("✅ [Calendar] Loaded credentials from GOOGLE_CREDENTIALS_B64");
-      return json;
-    } catch (err) {
-      console.error("❌ [Calendar] Failed to decode GOOGLE_CREDENTIALS_B64:", err.message);
-      throw err;
-    }
-  }
   if (inline) {
-    try {
-      const json = JSON.parse(
-        inline.trim().startsWith("{") ? inline : Buffer.from(inline, "base64").toString("utf8")
-      );
-      console.log("✅ [Calendar] Loaded credentials from GOOGLE_APPLICATION_CREDENTIALS_JSON");
-      return json;
-    } catch (err) {
-      console.error(
-        "❌ [Calendar] Failed to parse GOOGLE_APPLICATION_CREDENTIALS_JSON:", err.message
-      );
-      throw err;
-    }
+    const txt = inline.trim();
+    const json = JSON.parse(txt.startsWith("{") ? txt : Buffer.from(txt, "base64").toString("utf8"));
+    console.log("✅ [Calendar] Loaded credentials from GOOGLE_APPLICATION_CREDENTIALS_JSON");
+    return json;
   }
-  throw new Error(
-    "GOOGLE_CREDENTIALS_B64 or GOOGLE_APPLICATION_CREDENTIALS_JSON must be set."
-  );
+  if (b64) {
+    const json = JSON.parse(Buffer.from(b64, "base64").toString("utf8"));
+    console.log("✅ [Calendar] Loaded credentials from GOOGLE_CREDENTIALS_B64");
+    return json;
+  }
+  throw new Error("Missing Google credentials env");
 }
 
 function getJWTAuth() {
@@ -91,140 +96,107 @@ function getJWTAuth() {
   );
 }
 
-function normalizePhysKey(s) {
-  if (!s) return "";
-  return String(s).trim().toLowerCase().replace(/\s+/g, "_");
+function normalizePhys(s) {
+  return String(s || "").trim().toLowerCase().replace(/\s+/g, "_");
 }
 
-function ensureCalendarIdFromPhys(physKey) {
-  const key = normalizePhysKey(physKey);
-  const id = PHYSICIANS[key];
-  if (!id) {
-    throw new Error(`Unknown physician key '${physKey}'.`);
-  }
-  return { key, id };
+function getCalendarIdForPhys(phys) {
+  const k = normalizePhys(phys);
+  const id = PHYSICIANS[k];
+  if (!id) throw new Error(`Unknown physician '${phys}'`);
+  return { key: k, id };
 }
 
 const Calendar = {
-  /**
-   * Create an event.
-   * @param {string} calendarId
-   * @param {object} payload { start, end, summary, description, attendees? }
-   */
-  async createEvent(calendarId, payload) {
+  async createEvent({ physician, start, end, summary, phone, note }) {
+    const { key, id } = getCalendarIdForPhys(physician);
     const auth = getJWTAuth();
     const calendar = google.calendar({ version: "v3", auth });
-
-    const event = {
-      summary: payload.summary || "Appointment",
-      description: payload.description || "",
-      start: { dateTime: payload.start }, // Expect ISO string with timezone offset
-      end: { dateTime: payload.end },
-      attendees: payload.attendees || [],
-    };
-
-    const { data } = await calendar.events.insert({
-      calendarId,
-      requestBody: event,
-      conferenceDataVersion: 0,
-      supportsAttachments: false,
-    });
-
-    return data; // includes id, htmlLink, etc.
-  },
-
-  /**
-   * List upcoming events.
-   * @param {string} calendarId
-   * @param {number} maxResults
-   */
-  async upcoming(calendarId, maxResults = 10) {
-    const auth = getJWTAuth();
-    const calendar = google.calendar({ version: "v3", auth });
-
-    const { data } = await calendar.events.list({
-      calendarId,
-      timeMin: new Date().toISOString(),
-      maxResults: Math.min(Math.max(+maxResults || 10, 1), 50),
-      singleEvents: true,
-      orderBy: "startTime",
-    });
-    return data.items || [];
-  },
-
-  /**
-   * Delete event by id.
-   * @param {string} calendarId
-   * @param {string} eventId
-   */
-  async deleteEvent(calendarId, eventId) {
-    const auth = getJWTAuth();
-    const calendar = google.calendar({ version: "v3", auth });
-
-    await calendar.events.delete({
-      calendarId,
-      eventId,
-    });
-    return true;
-  },
-};
-
-// -------------------------- Express App ------------------------------
-const app = express();
-app.use(cors());
-app.use(express.json({ limit: "2mb" }));
-
-// Simple request log
-app.use((req, _res, next) => {
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
-  next();
-});
-
-// Health check
-app.get("/health", (_req, res) => {
-  res.status(200).send("ok");
-});
-
-// -------------------------- Calendar Routes --------------------------
-
-/**
- * Create event
- * body: {
- *   physician: "dr_emery",
- *   start: "2025-11-09T15:30:00-05:00",
- *   end:   "2025-11-09T16:00:00-05:00",
- *   summary?: "Test",
- *   email?: "patient@example.com",
- *   phone?: "+15551234567",
- *   note?: "notes"
- * }
- */
-app.post("/calendar/create", async (req, res) => {
-  try {
-    const { physician, start, end, summary, email, phone, note } = req.body || {};
-    if (!physician || !start || !end) {
-      return res.status(400).json({ ok: false, error: "physician, start, end are required" });
-    }
-    const { key, id } = ensureCalendarIdFromPhys(physician);
-
-    const attendees = [];
-    if (email) attendees.push({ email });
 
     const description = [
-      note ? `Note: ${note}` : null,
       phone ? `Phone: ${phone}` : null,
+      note ? `Note: ${note}` : null,
     ]
       .filter(Boolean)
       .join("\n");
 
-    const event = await Calendar.createEvent(id, {
-      start,
-      end,
-      summary: summary || "Consultation",
-      description,
-      attendees,
+    const { data } = await calendar.events.insert({
+      calendarId: id,
+      requestBody: {
+        summary: summary || "Consultation",
+        description,
+        start: { dateTime: start },
+        end: { dateTime: end },
+      },
     });
 
+    return { key, id, event: data };
+  },
+
+  async upcoming(physician, max = 10) {
+    const { key, id } = getCalendarIdForPhys(physician);
+    const auth = getJWTAuth();
+    const calendar = google.calendar({ version: "v3", auth });
+
+    const { data } = await calendar.events.list({
+      calendarId: id,
+      timeMin: new Date().toISOString(),
+      maxResults: Math.min(Math.max(+max || 10, 1), 50),
+      singleEvents: true,
+      orderBy: "startTime",
+    });
+
+    return { key, id, items: data.items || [] };
+  },
+
+  async deleteEvent(physician, eventId) {
+    const { id } = getCalendarIdForPhys(physician);
+    const auth = getJWTAuth();
+    const calendar = google.calendar({ version: "v3", auth });
+    await calendar.events.delete({ calendarId: id, eventId });
+    return true;
+  },
+};
+
+// --------------------------- Email -----------------------
+function makeTransport() {
+  const host = process.env.SMTP_HOST;
+  const port = Number(process.env.SMTP_PORT || 587);
+  const user = process.env.SMTP_USER;
+  const pass = process.env.SMTP_PASS;
+  if (!host || !user || !pass) return null;
+  return nodemailer.createTransport({ host, port, secure: port === 465, auth: { user, pass } });
+}
+
+async function sendVoicemailEmail({ branch, caller, recordingUrl, transcript }) {
+  const to = BRANCH_EMAILS[branch] || BRANCH_EMAILS.winchester;
+  const transporter = makeTransport();
+  if (!transporter) {
+    console.warn("[Email] SMTP not configured; skipping voicemail email");
+    return;
+  }
+  const html = `
+    <p><b>New voicemail</b> for <b>${branch}</b></p>
+    <p><b>From:</b> ${caller || "Unknown"}</p>
+    <p><b>Recording:</b> <a href="${recordingUrl}">${recordingUrl}</a></p>
+    ${transcript ? `<pre>${transcript}</pre>` : ""}
+  `;
+  await transporter.sendMail({
+    from: FROM_EMAIL,
+    to,
+    subject: `New Voicemail - ${branch} branch`,
+    html,
+  });
+}
+
+// ------------------------ Calendar Routes ----------------
+app.post("/calendar/create", async (req, res) => {
+  try {
+    const { physician, start, end, summary, phone, note } = req.body || {};
+    if (!physician || !start || !end) {
+      return res.status(400).json({ ok: false, error: "physician, start, end required" });
+    }
+    const { key, event } = await Calendar.createEvent({ physician, start, end, summary, phone, note });
     return res.json({
       ok: true,
       eventId: event.id,
@@ -232,150 +204,165 @@ app.post("/calendar/create", async (req, res) => {
       response: `Created appointment for ${PHYSICIAN_DISPLAY[key] || key}`,
     });
   } catch (err) {
-    console.error("Create error:", err?.response?.data || err.message);
-    return res.status(500).json({ ok: false, error: err.message || "create_failed" });
+    console.error("[/calendar/create] error:", err?.response?.data || err.message);
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-/**
- * Upcoming events
- * GET /calendar/upcoming/:physician?max=10
- */
 app.get("/calendar/upcoming/:physician", async (req, res) => {
   try {
     const { physician } = req.params;
     const { max } = req.query;
-    const { key, id } = ensureCalendarIdFromPhys(physician);
-    const items = await Calendar.upcoming(id, Number(max || 10));
-
-    const formatted = items.map((ev) => ({
-      id: ev.id,
-      summary: ev.summary,
-      start: ev.start?.dateTime || ev.start?.date,
-      end: ev.end?.dateTime || ev.end?.date,
-      htmlLink: ev.htmlLink,
-    }));
+    const { key, items } = await Calendar.upcoming(physician, Number(max || 10));
     res.json({
       ok: true,
       physician: PHYSICIAN_DISPLAY[key] || key,
-      count: formatted.length,
-      events: formatted,
+      count: items.length,
+      events: items.map(ev => ({
+        id: ev.id,
+        summary: ev.summary,
+        start: ev.start?.dateTime || ev.start?.date,
+        end: ev.end?.dateTime || ev.end?.date,
+        link: ev.htmlLink,
+      })),
     });
   } catch (err) {
-    console.error("Upcoming error:", err?.response?.data || err.message);
-    res.status(500).json({ ok: false, error: err.message || "list_failed" });
+    console.error("[/calendar/upcoming] error:", err?.response?.data || err.message);
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-/**
- * Delete event
- * body: { physician: "dr_emery", eventId: "xxxxxxxxxxxxxx" }
- */
 app.post("/calendar/delete", async (req, res) => {
   try {
     const { physician, eventId } = req.body || {};
-    if (!physician || !eventId) {
-      return res.status(400).json({ ok: false, error: "physician and eventId are required" });
-    }
-    const { key, id } = ensureCalendarIdFromPhys(physician);
-    await Calendar.deleteEvent(id, eventId);
-    res.json({
-      ok: true,
-      response: `Deleted event for ${PHYSICIAN_DISPLAY[key] || key}`,
-    });
+    if (!physician || !eventId) return res.status(400).json({ ok: false, error: "physician and eventId required" });
+    await Calendar.deleteEvent(physician, eventId);
+    res.json({ ok: true });
   } catch (err) {
-    console.error("Delete error:", err?.response?.data || err.message);
-    res.status(500).json({ ok: false, error: err.message || "delete_failed" });
+    console.error("[/calendar/delete] error:", err?.response?.data || err.message);
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// -------------------------- Retell webhook (example) -----------------
-/**
- * This example shows how you could call calendar helpers from Retell.
- * Feel free to adapt your action payload.
- *
- * - Book appointment:
- *    body: {
- *      action: "book_appointment",
- *      physician: "dr_emery",
- *      start: "2025-11-09T15:30:00-05:00",
- *      end:   "2025-11-09T16:00:00-05:00",
- *      summary?: "Consult",
- *      email?: "patient@x.com",
- *      phone?: "+1…",
- *      note?: "…"
- *    }
- *
- * - Check next:
- *    body: { action: "check_next", physician: "dr_emery" }
- */
+// ------------------------ Retell Action ------------------
 app.post("/retell/action", async (req, res) => {
   try {
     const event = req.body || {};
     const action = String(event.action || "").toLowerCase();
-
-    if (action === "book_appointment") {
-      const { physician, start, end, summary, email, phone, note } = event;
-      if (!physician || !start || !end) {
-        return res.json({ ok: false, response: "physician, start and end are required" });
-      }
-      const { key, id } = ensureCalendarIdFromPhys(physician);
-      const attendees = [];
-      if (email) attendees.push({ email });
-
-      const description = [
-        note ? `Note: ${note}` : null,
-        phone ? `Phone: ${phone}` : null,
-      ]
-        .filter(Boolean)
-        .join("\n");
-
-      const created = await Calendar.createEvent(id, {
-        start,
-        end,
-        summary: summary || "Consultation",
-        description,
-        attendees,
+    if (action.includes("book")) {
+      const r = await Calendar.createEvent({
+        physician: event.physician,
+        start: event.start,
+        end: event.end,
+        summary: event.summary,
+        phone: event.phone,
+        note: event.note,
       });
-
-      const reply = `Booked appointment for ${
-        PHYSICIAN_DISPLAY[key] || key
-      }.`;
-      return res.json({ ok: true, response: reply, eventId: created.id });
+      return res.json({ ok: true, response: `Booked for ${PHYSICIAN_DISPLAY[r.key] || r.key}`, eventId: r.event.id });
     }
-
-    if (action === "check_next") {
-      const { physician } = event;
-      if (!physician) return res.json({ ok: false, response: "physician required" });
-      const { key, id } = ensureCalendarIdFromPhys(physician);
-      const items = await Calendar.upcoming(id, 1);
-      if (!items.length) {
-        return res.json({
-          ok: true,
-          response: `No upcoming events for ${PHYSICIAN_DISPLAY[key] || key}.`,
-        });
-      }
-      const first = items[0];
-      const start = first.start?.dateTime || first.start?.date;
-      const reply = `Next appointment for ${
-        PHYSICIAN_DISPLAY[key] || key
-      }: ${first.summary || "Consult"}. Starts ${start}.`;
-      return res.json({ ok: true, response: reply, eventId: first.id });
+    if (action.includes("next")) {
+      const u = await Calendar.upcoming(event.physician, 1);
+      if (!u.items.length) return res.json({ ok: true, response: "No upcoming events." });
+      const first = u.items[0];
+      return res.json({ ok: true, response: `Next for ${PHYSICIAN_DISPLAY[u.key] || u.key}: ${first.summary} at ${first.start?.dateTime || first.start?.date}`, eventId: first.id });
     }
-
-    // Fallback: simple reply
-    return res.json({
-      ok: true,
-      response: "Action received.",
-    });
+    return res.json({ ok: true, response: "Ready." });
   } catch (err) {
-    console.error("Retell action error:", err?.response?.data || err.message);
-    res.json({ ok: false, response: "An error occurred." });
+    console.error("[/retell/action] error:", err?.response?.data || err.message);
+    res.json({ ok: false, response: "Error." });
   }
 });
 
-// -------------------------- Start server ----------------------------
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`WHC server listening on :${PORT}`);
+// ------------------------ Telnyx PBX ---------------------
+// Only activate if env is present
+const TELNYX_API_KEY = process.env.TELNYX_API_KEY;
+const TELNYX_CONNECTION_ID = process.env.TELNYX_CONNECTION_ID;
+const TELNYX_OUTBOUND_CALLER_ID = process.env.TELNYX_OUTBOUND_CALLER_ID;
+
+const telnyx = TELNYX_API_KEY
+  ? axios.create({
+      baseURL: "https://api.telnyx.com/v2/",
+      headers: { Authorization: `Bearer ${TELNYX_API_KEY}` },
+    })
+  : null;
+
+async function tx(cmd, payload) {
+  if (!telnyx) throw new Error("Telnyx not configured");
+  return telnyx.post(`call_commands/${cmd}`, payload);
+}
+
+// Helper: branch resolution (default Winchester)
+function resolveBranchFromMeta(meta = {}) {
+  const m = (meta.branch || meta.forwarded_from || "").toString().toLowerCase();
+  if (m.includes("portmore")) return "portmore";
+  if (m.includes("ardenne")) return "ardenne";
+  if (m.includes("sav")) return "sav";
+  return "winchester";
+}
+
+// Telnyx Inbound Webhook
+app.post("/telnyx/inbound", async (req, res) => {
+  if (!telnyx) return res.status(200).json({ ok: true, note: "Telnyx not configured" });
+  try {
+    const data = req.body?.data || {};
+    const eventType = data?.event_type;
+    const payload = data?.payload || {};
+    const callControlId = payload.call_control_id;
+
+    console.log("[Telnyx]", eventType);
+
+    // Answer & play MOH while transferring
+    if (eventType === "call.initiated") {
+      await tx("answer", { call_control_id: callControlId });
+      await tx("playback_start", {
+        call_control_id: callControlId,
+        audio_url: MOH_URL,
+        overlay: true,
+        loop: true,
+      });
+
+      // Decide branch to ring
+      const branch = resolveBranchFromMeta(payload.client_state ? JSON.parse(Buffer.from(payload.client_state, "base64").toString("utf8")) : {});
+      const target = BRANCH_NUMBERS[branch] || BRANCH_NUMBERS.winchester;
+
+      // Try branch (dual-channel: we could use transfer or dial outbound + bridge)
+      await tx("transfer", {
+        call_control_id: callControlId,
+        to: target,
+        from: TELNYX_OUTBOUND_CALLER_ID,
+        timeout_secs: Math.ceil(HANDOFF_TIMEOUT_MS / 1000),
+      });
+
+      return res.json({ ok: true });
+    }
+
+    // If branch answers, stop MOH
+    if (eventType === "call.bridged") {
+      await tx("playback_stop", { call_control_id: callControlId });
+      return res.json({ ok: true });
+    }
+
+    // If no answer -> voicemail
+    if (eventType === "call.ended" || eventType === "transfer.failed") {
+      // Start simple voicemail record (Telnyx will send recording.saved later if configured)
+      // Here we just email that no one answered; you can expand to start/stop record via call control if needed.
+      const branch = resolveBranchFromMeta(payload.client_state ? JSON.parse(Buffer.from(payload.client_state, "base64").toString("utf8")) : {});
+      await sendVoicemailEmail({
+        branch,
+        caller: payload?.from || payload?.from_number || "Unknown",
+        recordingUrl: "(no recording in this minimal build)",
+        transcript: null,
+      });
+      return res.json({ ok: true });
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("[/telnyx/inbound] error:", err?.response?.data || err.message);
+    res.status(200).json({ ok: true }); // acknowledge to avoid webhook retries
+  }
 });
+
+// ------------------------ Start --------------------------
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => console.log(`WHC server listening on :${PORT}`));
