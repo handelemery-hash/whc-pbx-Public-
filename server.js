@@ -1,305 +1,434 @@
 /**
- * Winchester Heart Centre – AI PBX Bridge with Telnyx handoff
- * - Receives Retell AI webhooks
- * - Sends branch emails
- * - Handoff to human via Telnyx (transfer live leg or outbound fallback)
+ * WHC PBX + Calendar + Handoff (Retell-first, Telnyx-optional)
+ * -------------------------------------------------------------
+ * - Health + logging
+ * - Google Calendar free-slot lookup and booking
+ * - Optional SMTP email
+ * - Retell Action Webhook:
+ *     • "handoff_branch": transfer caller to a configured branch number
+ *       - If TELNYX_* env exists, it will try Telnyx Call Control
+ *       - Otherwise, it returns a "transfer instruction" for Retell to do the PSTN transfer
+ *
+ * Env (required for calendar):
+ *   PORT=8080
+ *   GOOGLE_APPLICATION_CREDENTIALS_JSON=<your service-account JSON as one secret>
+ *
+ * Optional email:
+ *   SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS
+ *   MAIL_FROM="WHC Reception <reception@yourdomain.com>"
+ *   MAIL_TO=appointments@yourdomain.com
+ *
+ * Optional Telnyx (for in-server initiated handoff; not needed if Retell transfers directly):
+ *   TELNYX_API_KEY=
+ *   TELNYX_CONNECTION_ID=
+ *   TELNYX_OUTBOUND_CALLER_ID=+13056769686
+ *
+ * Timezone: America/Jamaica
  */
 
 import express from "express";
-import nodemailer from "nodemailer";
+import fs from "fs";
+import path from "path";
 import axios from "axios";
+import nodemailer from "nodemailer";
+import { google } from "googleapis";
 
+// --------------------------- Bootstrapping ---------------------------
 const app = express();
 const PORT = process.env.PORT || 8080;
+const JAMAICA_TZ = "America/Jamaica";
 
-// ──────────────────────────────────────────────
-// Middleware & basic routes
-// ──────────────────────────────────────────────
+// Persist Google creds from Railway secret to a temp file
+try {
+  const credsPath = path.join("/tmp", "google-creds.json");
+  if (!process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON) {
+    console.warn("[Calendar] GOOGLE_APPLICATION_CREDENTIALS_JSON not set.");
+  } else {
+    fs.writeFileSync(
+      credsPath,
+      process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON,
+      "utf8"
+    );
+    process.env.GOOGLE_APPLICATION_CREDENTIALS = credsPath;
+  }
+} catch (e) {
+  console.error("Failed to write Google creds JSON:", e);
+}
+
 app.use(express.json({ limit: "2mb" }));
-app.use((req, res, next) => {
+app.use((req, _res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
   next();
 });
-app.get("/health", (req, res) => res.status(200).send("ok"));
-app.get("/", (req, res) => res.status(200).send("root ok"));
 
-// ──────────────────────────────────────────────
-// Config
-// ──────────────────────────────────────────────
-const MOH_URL =
-  process.env.MOH_URL || "https://cdn.winchesterheartcentre.com/hold.mp3";
-
-const BRANCHES = {
-  WINCHESTER: {
-    numbers: ["+18766488257", "+18769082658", "+18763529677"],
-    email: process.env.EMAIL_WINCHESTER,
-    handoff: "+18769082658",
-  },
-  PORTMORE: {
-    numbers: ["+18766710478", "+18767042739", "+18763527650"],
-    email: process.env.EMAIL_PORTMORE,
-    handoffPrimary: "+18767042739",
-    handoffBackup: "+18766710478",
-  },
-  ARDENNE: {
-    numbers: ["+18766713825", "+18763531170"],
-    email: process.env.EMAIL_ARDENNE,
-    handoff: "+18766713825",
-  },
-  SAV: {
-    numbers: ["+18769540252", "+18762987513"],
-    email: process.env.EMAIL_SAV,
-    handoff: "+18769540252",
-  },
+// -------------------------- Config Maps ------------------------------
+// 1) Physicians → Google Calendar IDs (EDIT THESE)
+const PHYSICIANS = {
+  // Example:
+  // 'dr_williams': { calendarId: 'williams@yourdomain.com' },
+  // 'dr_reid':     { calendarId: 'reid@yourdomain.com' },
 };
 
-const HANDOFF_TIMEOUT_MS = Number(process.env.HANDOFF_TIMEOUT_MS || 25000);
+// 2) Branch phone numbers in E.164 (EDIT THESE)
+// Add all branches you want to handoff to
+const BRANCH_NUMBERS = {
+  // Examples:
+  // kingston:  '+18766488257',
+  // portmore:  '+18767042739', // primary
+  // portmore_alt: '+18766710478', // backup
+  // ardenne:  '+18769082658',
+  // sav:      '+18763529677',
+};
 
-// ──────────────────────────────────────────────
-// Email transport
-// ──────────────────────────────────────────────
+// Business hours (Mon–Fri 09:00–17:00)
+const WORK_START = { hour: 9, minute: 0 };
+const WORK_END = { hour: 17, minute: 0 };
+
+// --------------------------- Optional Email ---------------------------
 let transporter = null;
-if (process.env.SMTP_HOST && process.env.SMTP_USER) {
+if (
+  process.env.SMTP_HOST &&
+  process.env.SMTP_PORT &&
+  process.env.SMTP_USER &&
+  process.env.SMTP_PASS
+) {
   transporter = nodemailer.createTransport({
     host: process.env.SMTP_HOST,
-    port: Number(process.env.SMTP_PORT || 587),
-    secure: false,
+    port: Number(process.env.SMTP_PORT),
+    secure: Number(process.env.SMTP_PORT) === 465,
     auth: {
       user: process.env.SMTP_USER,
       pass: process.env.SMTP_PASS,
     },
   });
-} else {
-  console.warn("⚠️  SMTP not fully configured; email will be skipped.");
+
+  transporter.verify().then(
+    () => console.log("[SMTP] Transport verified."),
+    (err) => console.warn("[SMTP] Transport verify failed:", err?.message)
+  );
 }
 
-async function sendEmail(to, subject, text) {
-  if (!transporter || !to) {
-    console.warn("ℹ️  Skipping email (no transporter or recipient).");
-    return;
-  }
+async function sendMail({ subject, text }) {
+  if (!transporter) return;
+  const from = process.env.MAIL_FROM || "whc-bot@localhost";
+  const to = process.env.MAIL_TO || "";
+  if (!to) return;
+
   try {
-    await transporter.sendMail({
-      from: process.env.FROM_EMAIL || "no-reply@winchesterheartcentre.com",
-      to,
-      subject,
-      text,
-    });
-    console.log(`📧 Email sent to ${to}`);
+    await transporter.sendMail({ from, to, subject, text });
+    console.log("[SMTP] Sent:", subject);
   } catch (e) {
-    console.error("❌ Email send failed:", e.message);
+    console.warn("[SMTP] Send failed:", e?.message);
   }
 }
 
-// ──────────────────────────────────────────────
-// Helpers
-// ──────────────────────────────────────────────
-function detectBranchByToNumber(to) {
-  if (!to) return "WINCHESTER";
-  for (const [key, b] of Object.entries(BRANCHES)) {
-    if (b.numbers.includes(to)) return key;
-  }
-  return "WINCHESTER";
+// -------------------------- Google Calendar --------------------------
+const SCOPES = ["https://www.googleapis.com/auth/calendar"];
+const auth = new google.auth.GoogleAuth({ scopes: SCOPES });
+const calendar = google.calendar({ version: "v3", auth });
+
+function addMinutes(dt, mins) {
+  const d = new Date(dt);
+  d.setMinutes(d.getMinutes() + mins);
+  return d;
+}
+function isWeekend(d) {
+  const day = d.getDay();
+  return day === 0 || day === 6;
+}
+function dayWorkWindow(date) {
+  const start = new Date(date);
+  start.setHours(WORK_START.hour, WORK_START.minute, 0, 0);
+  const end = new Date(date);
+  end.setHours(WORK_END.hour, WORK_END.minute, 0, 0);
+  return { start, end };
 }
 
-// Telnyx client
-const telnyx = axios.create({
-  baseURL: "https://api.telnyx.com/v2",
-  timeout: 15000,
-  headers: {
-    Authorization: `Bearer ${process.env.TELNYX_API_KEY || ""}`,
-    "Content-Type": "application/json",
-  },
+async function getBusyBlocks(calendarId, timeMin, timeMax) {
+  const res = await calendar.freebusy.query({
+    requestBody: {
+      timeMin: timeMin.toISOString(),
+      timeMax: timeMax.toISOString(),
+      timeZone: JAMAICA_TZ,
+      items: [{ id: calendarId }],
+    },
+  });
+  const cal = res.data.calendars?.[calendarId];
+  return cal?.busy ?? [];
+}
+
+async function getFreeSlotsForDay(calendarId, date, durationMins, maxSlots = 10) {
+  if (isWeekend(date)) return [];
+  const { start, end } = dayWorkWindow(date);
+  const busy = await getBusyBlocks(calendarId, start, end);
+
+  const results = [];
+  let cursor = new Date(start);
+
+  while (cursor < end && results.length < maxSlots) {
+    const slotStart = new Date(cursor);
+    const slotEnd = addMinutes(slotStart, durationMins);
+    if (slotEnd > end) break;
+
+    const overlapsBusy = busy.some((b) => {
+      const bStart = new Date(b.start);
+      const bEnd = new Date(b.end);
+      return slotStart < bEnd && slotEnd > bStart;
+    });
+
+    if (!overlapsBusy) results.push(slotStart);
+    cursor = addMinutes(cursor, durationMins);
+  }
+  return results;
+}
+
+// GET /calendar/:phys/free?days=5&duration=15
+app.get("/calendar/:phys/free", async (req, res) => {
+  try {
+    const phys = req.params.phys;
+    const days = Math.min(parseInt(req.query.days ?? "5", 10), 14);
+    const duration = Math.max(5, parseInt(req.query.duration ?? "15", 10));
+
+    const doc = PHYSICIANS[phys];
+    if (!doc?.calendarId) {
+      return res
+        .status(400)
+        .json({ error: "Unknown physician. Add calendarId in PHYSICIANS." });
+    }
+    if (!process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON) {
+      return res.status(500).json({
+        error:
+          "GOOGLE_APPLICATION_CREDENTIALS_JSON is missing. Set it in Railway.",
+      });
+    }
+
+    const today = new Date();
+    const all = [];
+    for (let i = 0; i < days; i++) {
+      const date = new Date(today);
+      date.setDate(today.getDate() + i);
+      const slots = await getFreeSlotsForDay(doc.calendarId, date, duration, 10);
+      all.push({
+        date: date.toISOString().slice(0, 10),
+        slots: slots.map((s) => s.toISOString()),
+      });
+    }
+
+    res.json({
+      physician: phys,
+      duration_minutes: duration,
+      timezone: JAMAICA_TZ,
+      days: all,
+    });
+  } catch (err) {
+    console.error("GET /calendar/:phys/free error:", err);
+    res.status(500).json({ error: "Failed to fetch free slots." });
+  }
 });
 
-function telnyxReady() {
-  return !!(process.env.TELNYX_API_KEY && process.env.TELNYX_CONNECTION_ID);
-}
-
-/**
- * Transfer an existing Telnyx call-control leg to a destination number.
- * (Works when webhook includes inbound call_control_id)
- */
-async function transferExistingLeg(callControlId, toE164) {
-  console.log(`🔁 Transferring leg ${callControlId} -> ${toE164}`);
-  const url = `/calls/${callControlId}/actions/transfer`;
-  const body = {
-    to: toE164,
-    // optional: sip:..., or use audio_url during hold
-  };
-  const { data } = await telnyx.post(url, body);
-  return data;
-}
-
-/**
- * Create a new outbound call to the branch (fallback when we
- * don’t have a call_control_id for the inbound leg).
- */
-async function createOutboundCall(toE164, callerIdE164, whisper) {
-  console.log(`📞 Outbound call -> ${toE164} (from ${callerIdE164})`);
-  const payload = {
-    connection_id: process.env.TELNYX_CONNECTION_ID,
-    to: toE164,
-    from: process.env.TELNYX_OUTBOUND_CALLER_ID || callerIdE164,
-    timeout_secs: Math.ceil(HANDOFF_TIMEOUT_MS / 1000),
-    // Optional: answer_url or audio_url to play a whisper
-    // audio_url: MOH_URL,
-  };
-  const { data } = await telnyx.post("/calls", payload);
-  // Optionally play a whisper to the callee:
-  if (whisper) {
-    try {
-      await telnyx.post(`/calls/${data.data.call_control_id}/actions/speak`, {
-        voice: "female",
-        language: "en-US",
-        payload: whisper,
-      });
-    } catch (e) {
-      console.warn("Whisper speak failed:", e?.response?.data || e.message);
-    }
-  }
-  return data;
-}
-
-// ──────────────────────────────────────────────
-// Retell Webhook
-// ──────────────────────────────────────────────
-app.post("/retell/action", async (req, res) => {
-  // Always ACK immediately
-  res.status(200).json({ ok: true });
-
+// POST /calendar/:phys/book
+// Body: { start: ISOString, duration: minutes, patientName, caller, notes }
+app.post("/calendar/:phys/book", async (req, res) => {
   try {
-    console.log("🎧 Retell webhook:", JSON.stringify(req.body, null, 2));
-    const { event, call, data } = req.body || {};
-    const from = call?.from || "unknown";
-    const to = call?.to || "unknown";
-    const branchKey = detectBranchByToNumber(to);
-    const branch = BRANCHES[branchKey];
-
-    // 1) call started → send heads-up email
-    if (event === "call.initiated") {
-      await sendEmail(
-        branch.email,
-        `[${branchKey}] New Call`,
-        `New call from ${from} to ${to}\nMOH: ${MOH_URL}`
-      );
+    const phys = req.params.phys;
+    const doc = PHYSICIANS[phys];
+    if (!doc?.calendarId) {
+      return res
+        .status(400)
+        .json({ error: "Unknown physician. Add calendarId in PHYSICIANS." });
+    }
+    const {
+      start,
+      duration = 15,
+      patientName = "Patient",
+      caller = "",
+      notes = "",
+    } = req.body || {};
+    if (!start) return res.status(400).json({ error: "Missing 'start' ISO datetime" });
+    if (!process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON) {
+      return res.status(500).json({
+        error:
+          "GOOGLE_APPLICATION_CREDENTIALS_JSON is missing. Set it in Railway.",
+      });
     }
 
-    // 2) voicemail → email link
-    if (event === "voicemail.received") {
-      const audio = data?.recording_url || "(no recording url)";
-      await sendEmail(
-        branch.email,
-        `[VOICEMAIL] ${branchKey}`,
-        `Voicemail from ${from}\nAudio: ${audio}`
-      );
-    }
+    const startDt = new Date(start);
+    const endDt = addMinutes(startDt, duration);
 
-    // 3) analysis → optional email (nice for triage logs)
-    if (event === "call_analyzed") {
-      await sendEmail(
-        branch.email,
-        `[${branchKey}] Call Analyzed`,
-        `From ${from} to ${to}\n\n${JSON.stringify(data, null, 2)}`
-      );
-    }
+    const event = {
+      summary: `WHC Phone booking – ${patientName}`,
+      description: `${notes}${caller ? `\nCaller: ${caller}` : ""}`,
+      start: { dateTime: startDt.toISOString(), timeZone: JAMAICA_TZ },
+      end: { dateTime: endDt.toISOString(), timeZone: JAMAICA_TZ },
+    };
 
-    // 4) custom handoff action from Retell (what we care about now)
-    // Have your Retell agent send:
-    // { "event":"action", "data": { "action":"transfer", "target":"PORTMORE" , "call_control_id":"xxxx" } }
-    if (event === "action" && data?.action === "transfer") {
-      const target = (data?.target || branchKey || "WINCHESTER").toUpperCase();
-      let dest = BRANCHES[target]?.handoffPrimary || BRANCHES[target]?.handoff;
+    const created = await calendar.events.insert({
+      calendarId: doc.calendarId,
+      requestBody: event,
+      conferenceDataVersion: 0,
+      sendUpdates: "all",
+    });
 
-      // Portmore fallback
-      if (target === "PORTMORE" && !dest) {
-        dest = BRANCHES.PORTMORE.handoffPrimary;
+    await sendMail({
+      subject: `New booking for ${phys} – ${patientName}`,
+      text: `Booking confirmed for ${patientName}
+Physician: ${phys}
+Start: ${startDt.toISOString()}
+Duration: ${duration} minutes
+Caller: ${caller}
+Notes: ${notes}
+Event: ${created.data.htmlLink || ""}`,
+    });
+
+    res.json({
+      physician: phys,
+      status: "booked",
+      eventId: created.data.id,
+      htmlLink: created.data.htmlLink,
+      start: startDt.toISOString(),
+      end: endDt.toISOString(),
+      timezone: JAMAICA_TZ,
+    });
+  } catch (err) {
+    console.error("POST /calendar/:phys/book error:", err);
+    res.status(500).json({ error: "Failed to create event." });
+  }
+});
+
+// ----------------------- (Optional) Telnyx Handoff --------------------
+// Only used if TELNYX_* env are present. We keep it simple: we trigger an
+// outbound PSTN leg to the branch number. In real bridging scenarios, you'd
+// bridge with your inbound leg using Call Control events.
+async function handoffViaTelnyx(toNumber, callerId) {
+  const apiKey = process.env.TELNYX_API_KEY;
+  const connectionId = process.env.TELNYX_CONNECTION_ID;
+  const fromNumber =
+    callerId || process.env.TELNYX_OUTBOUND_CALLER_ID || "+10000000000";
+
+  if (!apiKey || !connectionId) {
+    throw new Error("Telnyx not configured.");
+  }
+
+  const url = "https://api.telnyx.com/v2/call_control/calls";
+  const headers = {
+    Authorization: `Bearer ${apiKey}`,
+    "Content-Type": "application/json",
+  };
+
+  // This initiates an outbound leg. Without an inbound leg to bridge,
+  // the transfer is effectively "call the branch directly". If you want
+  // a live bridge, you’ll need to pass/track the Retell inbound leg id
+  // and use Call Control (answer, bridge, etc).
+  const body = {
+    connection_id: connectionId,
+    to: toNumber,
+    from: fromNumber,
+  };
+
+  const resp = await axios.post(url, body, { headers, timeout: 8000 });
+  return resp.data;
+}
+
+// ------------------------ Retell Action Webhook -----------------------
+// Retell can call this endpoint with an "action_type" and payload.
+// We recognize 'handoff_branch' and return a transfer directive
+// (or use Telnyx if configured).
+//
+// NOTE: Different Retell plans/sdks send slightly different schemas.
+// If your agent expects a specific response shape, adapt the response
+// object at the two places marked: (A) & (B).
+app.post("/retell/action", async (req, res) => {
+  try {
+    console.log("[Retell Action]", JSON.stringify(req.body));
+
+    const action = req.body?.action_type || req.body?.action || "";
+    const payload = req.body?.payload || req.body || {};
+    const caller = payload?.from_number || req.body?.from_number || "";
+
+    if (action === "handoff_branch") {
+      const key = (payload?.branch || "").toLowerCase();
+      const toNumber = BRANCH_NUMBERS[key];
+
+      if (!toNumber) {
+        return res.status(400).json({
+          error: `Unknown branch '${payload?.branch}'. Configure BRANCH_NUMBERS.`,
+        });
       }
 
-      if (!dest) {
-        console.warn("No destination configured for target:", target);
-      } else if (!telnyxReady()) {
-        console.warn("Telnyx not configured; cannot transfer.");
-        await sendEmail(
-          branch.email,
-          `[${target}] Transfer Requested (Telnyx not configured)`,
-          `Caller ${from} requested transfer to ${target} (${dest}).`
-        );
-      } else {
+      // If Telnyx configured -> try outbound via Telnyx
+      if (
+        process.env.TELNYX_API_KEY &&
+        process.env.TELNYX_CONNECTION_ID &&
+        process.env.TELNYX_OUTBOUND_CALLER_ID
+      ) {
         try {
-          // Prefer true transfer if we have call_control_id of the inbound leg:
-          if (data?.call_control_id) {
-            await transferExistingLeg(data.call_control_id, dest);
-            await sendEmail(
-              branch.email,
-              `[${target}] Live Transfer`,
-              `Transferred live call from ${from} to ${dest}.`
-            );
-          } else {
-            // Fallback: create outbound call to the branch with a whisper
-            const whisper = `Winchester Heart Centre call for ${target}. Caller number ${from}.`;
-            await createOutboundCall(dest, from, whisper);
-            await sendEmail(
-              branch.email,
-              `[${target}] Callback Dial Started`,
-              `Placed outbound call to ${dest}. Caller: ${from}`
-            );
-          }
+          const telnyxResp = await handoffViaTelnyx(toNumber, caller);
+          console.log("[Telnyx] Outbound call created:", telnyxResp?.data?.id);
+
+          // (A) Response back to Retell when we dialed via Telnyx ourselves:
+          return res.json({
+            ok: true,
+            method: "telnyx",
+            telnyx_call_id: telnyxResp?.data?.id || null,
+            message: `Dialed ${toNumber} via Telnyx`,
+          });
         } catch (e) {
-          console.error("Transfer/Outbound error:", e?.response?.data || e);
-          await sendEmail(
-            branch.email,
-            `[${target}] Transfer Error`,
-            `Error during transfer for caller ${from} → ${dest}.\n\n${
-              e?.response?.data
-                ? JSON.stringify(e.response.data, null, 2)
-                : e.message
-            }`
-          );
+          console.warn("[Telnyx] Handoff failed, falling back to transfer:", e?.message);
+          // fall through to Retell transfer
         }
       }
+
+      // Otherwise: ask Retell to transfer the call
+      // (B) Adjust this shape to the schema your Retell agent expects.
+      return res.json({
+        ok: true,
+        action: "transfer",
+        phone_number: toNumber,
+        message: `Transfer caller to ${key} (${toNumber})`,
+      });
     }
 
-    // log unknown events for visibility
-    if (
-      ![
-        "call.initiated",
-        "voicemail.received",
-        "call_analyzed",
-        "action",
-      ].includes(event)
-    ) {
-      console.log("ℹ️ Unhandled event:", event);
-    }
-  } catch (err) {
-    console.error("❌ Webhook error:", err);
+    // Default no-op
+    return res.json({ ok: true, note: "no action taken" });
+  } catch (e) {
+    console.error("/retell/action error", e);
+    res.status(500).json({ error: "action failed" });
   }
 });
 
-// ──────────────────────────────────────────────
-// Start + keep-alive + graceful shutdown
-// ──────────────────────────────────────────────
-const server = app.listen(PORT, () =>
-  console.log(`🚀 WHC PBX server listening on port ${PORT}`)
-);
+// Optional summary hook
+app.post("/retell/summary", async (req, res) => {
+  try {
+    console.log("[Retell Summary]", JSON.stringify(req.body));
+    const caller = req.body?.from_number || "";
+    const text =
+      typeof req.body?.summary === "string"
+        ? req.body.summary
+        : JSON.stringify(req.body, null, 2);
+    await sendMail({ subject: `Call summary ${caller}`, text });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("/retell/summary error", e);
+    res.status(500).json({ error: "summary failed" });
+  }
+});
 
-const KEEPALIVE_MS = 240000;
-setInterval(() => {
-  fetch(`http://127.0.0.1:${PORT}/health`)
-    .then((r) => console.log("🔄 Keep-alive ping:", r.status))
-    .catch((e) => console.error("Keep-alive error:", e.message));
-}, KEEPALIVE_MS);
+// -------------------------- Basic Routes -----------------------------
+app.get("/", (_req, res) => {
+  res.type("text/plain").send("WHC PBX + Calendar + Handoff is running.");
+});
+app.get("/health", (_req, res) => {
+  res.type("text/plain").send("ok");
+});
 
-function shutdown(signal) {
-  console.log(`↩️  Received ${signal}. Closing server...`);
-  server.close(() => {
-    console.log("✅ HTTP server closed.");
-    process.exit(0);
-  });
-  setTimeout(() => {
-    console.warn("⏱️  Force exiting after 5s.");
-    process.exit(0);
-  }, 5000).unref();
-}
-process.on("SIGINT", () => shutdown("SIGINT"));
-process.on("SIGTERM", () => shutdown("SIGTERM"));
+// -------------------------- Error Handler ----------------------------
+app.use((err, _req, res, _next) => {
+  console.error("Unhandled error:", err);
+  res.status(500).json({ error: "internal server error" });
+});
+
+// -------------------------- Start Server -----------------------------
+app.listen(PORT, () => {
+  console.log(`WHC server listening on :${PORT}`);
+});
+
