@@ -1,13 +1,15 @@
 /**
- * Winchester Heart Centre – AI PBX Server
- * Handles Retell AI webhooks, Telnyx call control, email summaries,
- * and call routing to Winchester / Portmore / Ardenne / Sav branches.
+ * Winchester Heart Centre – AI PBX Bridge
+ * - Receives Retell AI webhooks
+ * - Routes by branch (Winchester / Portmore / Ardenne / Sav)
+ * - Sends email summaries / voicemail alerts
+ * - Ready for Telnyx call-control integration
  */
 
 import express from "express";
-import bodyParser from "body-parser";
-import axios from "axios";
 import nodemailer from "nodemailer";
+// Optional for future Telnyx actions:
+// import axios from "axios";
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -15,9 +17,9 @@ const PORT = process.env.PORT || 8080;
 // ──────────────────────────────────────────────
 // Middleware
 // ──────────────────────────────────────────────
-app.use(bodyParser.json({ limit: "5mb" }));
+app.use(express.json({ limit: "2mb" }));
 
-// Log every incoming request for visibility
+// Log every incoming request (shows in Railway logs)
 app.use((req, res, next) => {
   console.log(
     `[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`
@@ -25,13 +27,21 @@ app.use((req, res, next) => {
   next();
 });
 
-// Simple health endpoints for Railway / debugging
-app.get("/", (req, res) => res.status(200).send("root ok"));
+// ──────────────────────────────────────────────
+/** Health & Root (for testing) */
+// ──────────────────────────────────────────────
 app.get("/health", (req, res) => res.status(200).send("ok"));
+app.get("/", (req, res) => res.status(200).send("root ok"));
 
 // ──────────────────────────────────────────────
 // Configuration
 // ──────────────────────────────────────────────
+/** Music On Hold (used when we later add transfers) */
+const MOH_URL =
+  process.env.MOH_URL ||
+  "https://cdn.winchesterheartcentre.com/hold.mp3";
+
+/** Branch directory (numbers used to identify which branch was called) */
 const BRANCHES = {
   WINCHESTER: {
     numbers: ["+18766488257", "+18769082658", "+18763529677"],
@@ -41,7 +51,7 @@ const BRANCHES = {
   PORTMORE: {
     numbers: ["+18766710478", "+18767042739", "+18763527650"],
     email: process.env.EMAIL_PORTMORE,
-    handoff: ["+18767042739", "+18766710478"],
+    handoff: ["+18767042739", "+18766710478"], // primary, fallback
   },
   ARDENNE: {
     numbers: ["+18766713825", "+18763531170"],
@@ -55,29 +65,34 @@ const BRANCHES = {
   },
 };
 
-const MOH_URL =
-  process.env.MOH_URL ||
-  "https://cdn.winchesterheartcentre.com/hold.mp3";
+// ──────────────────────────────────────────────
+// Email transport (for summaries / voicemail alerts)
+// ──────────────────────────────────────────────
+let transporter = null;
+if (process.env.SMTP_HOST && process.env.SMTP_PORT && process.env.SMTP_USER) {
+  transporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: Number(process.env.SMTP_PORT) || 587,
+    secure: false,
+    auth: {
+      user: process.env.SMTP_USER,
+      pass: process.env.SMTP_PASS,
+    },
+  });
+} else {
+  console.warn(
+    "⚠️  SMTP not fully configured (no SMTP_HOST/SMTP_USER). Email sending will be skipped."
+  );
+}
 
-// ──────────────────────────────────────────────
-// Email transport (for voicemail + summaries)
-// ──────────────────────────────────────────────
-const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST,
-  port: process.env.SMTP_PORT,
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS,
-  },
-});
-
-// ──────────────────────────────────────────────
-// Utility: send email summary / voicemail alert
-// ──────────────────────────────────────────────
 async function sendEmail(to, subject, text) {
+  if (!transporter || !to) {
+    console.warn("ℹ️  Skipping email: transporter or recipient missing.");
+    return;
+  }
   try {
     await transporter.sendMail({
-      from: process.env.FROM_EMAIL,
+      from: process.env.FROM_EMAIL || "no-reply@winchesterheartcentre.com",
       to,
       subject,
       text,
@@ -89,64 +104,100 @@ async function sendEmail(to, subject, text) {
 }
 
 // ──────────────────────────────────────────────
-// Retell AI Webhook Handler
+// Helpers
 // ──────────────────────────────────────────────
+function detectBranchByToNumber(to) {
+  if (!to) return "WINCHESTER"; // default
+  for (const [key, b] of Object.entries(BRANCHES)) {
+    if (b.numbers.includes(to)) return key;
+  }
+  return "WINCHESTER";
+}
+
+// ──────────────────────────────────────────────
+// Retell Webhook
+// ──────────────────────────────────────────────
+/**
+ * NOTE: Retell should POST to:
+ * https://<your-domain>.railway.app/retell/action
+ */
 app.post("/retell/action", async (req, res) => {
-  // Always respond quickly so Retell doesn’t retry
+  // Acknowledge immediately so Retell doesn’t retry
   res.status(200).json({ ok: true });
 
-  console.log("🎧 Received Retell webhook:");
-  console.log(JSON.stringify(req.body, null, 2));
-
   try {
-    const { event, call, data } = req.body;
-    console.log(`➡️ Event: ${event || "unknown"}`);
+    console.log("🎧 Received Retell webhook:");
+    console.log(JSON.stringify(req.body, null, 2));
 
-    // Example: when Retell notifies of a new incoming call
+    const { event, call, data } = req.body || {};
+    const from = call?.from || "unknown";
+    const to = call?.to || "unknown";
+
+    // Identify branch
+    const branchKey = detectBranchByToNumber(to);
+    const branch = BRANCHES[branchKey];
+
     if (event === "call.initiated") {
-      const from = call?.from || "unknown";
-      const to = call?.to || "unknown";
-
-      // Determine which branch based on “to” number
-      let branchKey = "WINCHESTER"; // default
-      for (const [key, b] of Object.entries(BRANCHES)) {
-        if (b.numbers.includes(to)) branchKey = key;
-      }
-      console.log(`📞 Incoming call for branch: ${branchKey}`);
-
-      const branch = BRANCHES[branchKey];
       const summary = `New call from ${from} to ${to} → ${branchKey}`;
-
-      // Send summary email
-      await sendEmail(branch.email, `[${branchKey}] New Call`, summary);
-
-      // TODO: if using Telnyx, initiate handoff here
-      // await axios.post('https://api.telnyx.com/v2/calls', { ... });
-    }
-
-    // Example: when voicemail or message left
-    if (event === "voicemail.received") {
-      const branch = BRANCHES.WINCHESTER;
-      const audioUrl = data?.recording_url || "(no audio)";
+      console.log("📞", summary);
       await sendEmail(
         branch.email,
-        `[VOICEMAIL] New message`,
-        `Voicemail received: ${audioUrl}`
+        `[${branchKey}] New Call`,
+        `${summary}\nMOH: ${MOH_URL}`
       );
+
+      // TODO: when ready, place Telnyx transfer here:
+      // await axios.post('https://api.telnyx.com/v2/calls', { ... }, { headers: { Authorization: `Bearer ${process.env.TELNYX_API_KEY}` }});
     }
 
-    // Log any other events for visibility
+    if (event === "voicemail.received") {
+      const audio = data?.recording_url || "(no recording URL)";
+      const msg = `Voicemail for ${branchKey} from ${from}\nAudio: ${audio}`;
+      console.log("📨", msg);
+      await sendEmail(branch.email, `[VOICEMAIL] ${branchKey}`, msg);
+    }
+
+    // Log everything else for now
     if (!["call.initiated", "voicemail.received"].includes(event)) {
-      console.log("ℹ️ Unhandled event type:", event);
+      console.log("ℹ️ Unhandled event:", event);
     }
   } catch (err) {
-    console.error("❌ Webhook handler error:", err);
+    console.error("❌ Webhook error:", err);
   }
 });
 
 // ──────────────────────────────────────────────
-// Start Server
+// Start server
 // ──────────────────────────────────────────────
-app.listen(PORT, () =>
+const server = app.listen(PORT, () =>
   console.log(`🚀 WHC PBX server listening on port ${PORT}`)
 );
+
+// ──────────────────────────────────────────────
+/** Keep-alive: ping the local server every 4 minutes
+ *  (prevents the free tier from idling too aggressively)
+ */
+const KEEPALIVE_MS = 240000; // 4 minutes
+setInterval(() => {
+  // Use localhost inside the same container
+  fetch(`http://127.0.0.1:${PORT}/health`)
+    .then((r) => console.log("🔄 Keep-alive ping:", r.status))
+    .catch((e) => console.error("Keep-alive error:", e.message));
+}, KEEPALIVE_MS);
+
+// ──────────────────────────────────────────────
+/** Graceful shutdown */
+function shutdown(signal) {
+  console.log(`↩️  Received ${signal}. Closing server...`);
+  server.close(() => {
+    console.log("✅ HTTP server closed.");
+    process.exit(0);
+  });
+  // Force exit if not closed in 5s
+  setTimeout(() => {
+    console.warn("⏱️  Force exiting after 5s.");
+    process.exit(0);
+  }, 5000).unref();
+}
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
