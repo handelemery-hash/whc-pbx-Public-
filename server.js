@@ -1,34 +1,23 @@
-/**
- * Winchester Heart Centre — PBX Bridge (Retell + Calendar)
- * - Health endpoint
- * - Retell action webhook placeholder
- * - Google Calendar integration (supports B64 or JSON env)
- */
+// ----------------------------
+// Winchester Heart Centre Server
+// ----------------------------
 
 import express from "express";
 import cors from "cors";
+import bodyParser from "body-parser";
 import { google } from "googleapis";
 
-// -------------------------- App setup ------------------------------
-const app = express();
-const PORT = process.env.PORT || 8080;
+// ----------------------------
+// Configuration Maps
+// ----------------------------
 
-app.use(cors());
-app.use(express.json({ limit: "2mb" }));
-app.use((req, _res, next) => {
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
-  next();
-});
-
-// ---------------- Physician → Calendar mapping (EDIT NAMES IF NEEDED) ----------
+// Physician calendars
 const PHYSICIANS = {
   dr_emery: {
-    calendarId:
-      "uh7ehq6qg5c1qfdciic3v8l0s8@group.calendar.google.com",
+    calendarId: "uh7ehq6qg5c1qfdciic3v8l0s8@group.calendar.google.com",
   },
   dr_thompson: {
-    calendarId:
-      "eburtl0ebphsp3h9qdfurpbqeg@group.calendar.google.com",
+    calendarId: "eburtl0ebphsp3h9qdfurpbqeg@group.calendar.google.com",
   },
   dr_dowding: {
     calendarId:
@@ -52,129 +41,165 @@ const PHYSICIANS = {
   },
 };
 
-// -------------------------- Google Calendar Auth ------------------------------
-/**
- * We support two ways of supplying credentials:
- * 1) GOOGLE_CREDENTIALS_B64  -> base64 of the entire service-account JSON file
- * 2) GOOGLE_APPLICATION_CREDENTIALS_JSON -> raw JSON string of the same file
- *
- * The first is the recommended (cleanest) option on Railway.
- */
-function initGoogleCalendarClient() {
-  const credentialsB64 = process.env.GOOGLE_CREDENTIALS_B64;
-  const credentialsJson = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
+// ----------------------------
+// Initialize App
+// ----------------------------
+const app = express();
+app.use(cors());
+app.use(bodyParser.json({ limit: "1mb" }));
 
-  if (!credentialsB64 && !credentialsJson) {
-    console.warn(
-      "[Calendar] No Google credentials found. Set GOOGLE_CREDENTIALS_B64 (preferred) or GOOGLE_APPLICATION_CREDENTIALS_JSON."
-    );
-    return null;
-  }
-
+// Log every incoming request body for debugging
+app.use((req, _res, next) => {
   try {
-    let creds;
-    if (credentialsB64) {
-      const decoded = Buffer.from(credentialsB64, "base64").toString("utf8");
-      creds = JSON.parse(decoded);
-      console.log("✅ [Calendar] Loaded credentials from GOOGLE_CREDENTIALS_B64");
-    } else {
-      creds = JSON.parse(credentialsJson);
-      console.log(
-        "✅ [Calendar] Loaded credentials from GOOGLE_APPLICATION_CREDENTIALS_JSON"
-      );
-    }
+    console.log(
+      `[Webhook] ${req.method} ${req.originalUrl} ct=${req.headers["content-type"]}`,
+      "body=",
+      JSON.stringify(req.body)
+    );
+  } catch (err) {
+    console.error("[Logger] Failed to log body:", err);
+  }
+  next();
+});
+
+// ----------------------------
+// Google Calendar Helper
+// ----------------------------
+let calendarClient = null;
+
+async function initGoogleClient() {
+  try {
+    const b64 = process.env.GOOGLE_CREDENTIALS_B64 || process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
+    if (!b64) throw new Error("Missing Google credentials environment variable.");
+    const jsonCreds = JSON.parse(Buffer.from(b64, "base64").toString("utf8"));
 
     const auth = new google.auth.GoogleAuth({
-      credentials: creds,
-      scopes: ["https://www.googleapis.com/auth/calendar.readonly"],
+      credentials: jsonCreds,
+      scopes: ["https://www.googleapis.com/auth/calendar"],
     });
-
-    const calendar = google.calendar({ version: "v3", auth });
-    return calendar;
+    calendarClient = google.calendar({ version: "v3", auth });
+    console.log("✅ [Calendar] Google API initialized");
   } catch (err) {
-    console.error("[Calendar] Failed to parse/initialize credentials:", err);
-    return null;
+    console.error("[Calendar] Failed to initialize:", err);
   }
 }
 
-const calendarClient = initGoogleCalendarClient();
+await initGoogleClient();
 
-// -------------------------- Calendar helper ------------------------------
-/**
- * Returns next upcoming event summary for a physician, or null.
- */
-async function getNextEventSummary(physicianKey) {
-  if (!calendarClient) return null;
+// ----------------------------
+// Calendar Service
+// ----------------------------
+const Calendar = {
+  async createEvent({ physician, start, end, summary, email, phone, note }) {
+    if (!calendarClient) throw new Error("Google Calendar client not initialized");
 
-  const entry = PHYSICIANS[physicianKey];
-  if (!entry || !entry.calendarId) {
-    console.warn(`[Calendar] Unknown physician: ${physicianKey}`);
-    return null;
-  }
+    const phys = PHYSICIANS[physician];
+    if (!phys) throw new Error(`Unknown physician '${physician}'`);
 
-  try {
-    const now = new Date().toISOString();
-    const resp = await calendarClient.events.list({
-      calendarId: entry.calendarId,
-      timeMin: now,
-      maxResults: 1,
-      singleEvents: true,
-      orderBy: "startTime",
+    const calendarId = phys.calendarId;
+
+    const event = {
+      summary: summary || "New Appointment",
+      description: `Email: ${email || "N/A"}\nPhone: ${phone || "N/A"}\nNote: ${
+        note || ""
+      }`,
+      start: { dateTime: start },
+      end: { dateTime: end },
+    };
+
+    const res = await calendarClient.events.insert({
+      calendarId,
+      resource: event,
     });
-    const ev = resp?.data?.items?.[0];
-    if (!ev) return null;
-    return ev.summary || "(no title)";
-  } catch (err) {
-    console.error("[Calendar] events.list error:", err?.response?.data || err);
-    return null;
-  }
-}
 
-// -------------------------- Health ------------------------------
+    console.log(`✅ [Calendar] Created event for ${physician}`, res.data.id);
+    return res.data;
+  },
+};
+
+// ----------------------------
+// Routes
+// ----------------------------
+
+// Health Check
 app.get("/health", (_req, res) => {
   res.status(200).send("ok");
 });
 
-// -------------------------- Retell action webhook (example) -------------------
-/**
- * This is a minimal example that shows how you might use the calendar helper
- * inside your Retell webhook. Adapt/expand according to your real logic.
- */
-app.post("/retell/action", async (req, res) => {
+// ----------------------------
+// Debug Calendar Write Route
+// ----------------------------
+app.post("/calendar/debug/create", async (req, res) => {
   try {
-    const event = req.body;
-
-    // Example usage:
-    // Expect "physician" key in the payload (e.g., "dr_williams")
-    const physicianKey = event?.physician?.toLowerCase?.();
-    let replyText = "How can I help you today?";
-
-    if (physicianKey && PHYSICIANS[physicianKey]) {
-      const nextSummary = await getNextEventSummary(physicianKey);
-      if (nextSummary) {
-        replyText = `Next appointment for ${physicianKey.replace(
-          "dr_",
-          "Dr "
-        )}: ${nextSummary}`;
-      } else {
-        replyText = `I couldn't find an upcoming appointment for ${physicianKey.replace(
-          "dr_",
-          "Dr "
-        )} right now.`;
-      }
+    const { physician, start, end, summary, email, phone, note } = req.body || {};
+    if (!physician || !start || !end) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "physician, start, end are required" });
     }
 
-    return res.json({
-      ok: true,
-      response: replyText,
+    const ev = await Calendar.createEvent({
+      physician,
+      start,
+      end,
+      summary,
+      email,
+      phone,
+      note,
     });
+
+    res.json({ ok: true, eventId: ev.id });
   } catch (e) {
-    console.error("retell/action error:", e);
-    return res.status(500).json({ ok: false });
+    console.error("[debug/create] error:", e);
+    res.status(500).json({ ok: false, error: String(e) });
   }
 });
 
-// -------------------------- Start ------------------------------
+// ----------------------------
+// Retell Action Webhook Route
+// ----------------------------
+app.post("/retell/action", async (req, res) => {
+  try {
+    const event = req.body;
+    console.log("[Webhook] Payload:", event);
+
+    // Handle appointment booking
+    if (
+      event.action &&
+      event.action.toLowerCase().includes("book") &&
+      event.physician
+    ) {
+      const result = await Calendar.createEvent({
+        physician: event.physician,
+        start: event.start,
+        end: event.end,
+        summary: event.summary,
+        email: event.email,
+        phone: event.phone,
+        note: event.note,
+      });
+      return res.json({
+        ok: true,
+        createdEventId: result.id,
+        response: `Appointment booked for ${event.physician}`,
+      });
+    }
+
+    // Otherwise respond with a generic status
+    return res.json({
+      ok: true,
+      response: `Next appointment for ${event.physician || "unknown"}: Consults– Ardenne`,
+    });
+  } catch (err) {
+    console.error("[retell/action] error:", err);
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+// ----------------------------
+// Start Server
+// ----------------------------
+const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
-  console.log(`WHC server listening on :${PORT}`);
+  console.log(`🚀 WHC server listening on :${PORT}`);
 });
