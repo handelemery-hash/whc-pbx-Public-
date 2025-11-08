@@ -1,6 +1,7 @@
 // server.js — WHC PBX + Calendar (Retell + Telnyx + Email)
 // ---------------------------------------------------------
 
+import http from "http";
 import express from "express";
 import cors from "cors";
 import { google } from "googleapis";
@@ -12,7 +13,9 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
+// health + root (for platform probes)
 app.get("/health", (_req, res) => res.status(200).send("ok"));
+app.get("/", (_req, res) => res.status(200).send("WHC PBX running"));
 
 // Simple req log
 app.use((req, _res, next) => {
@@ -42,20 +45,13 @@ const FROM_EMAIL = process.env.FROM_EMAIL || "Winchester Heart Centre <no-reply@
 
 // Physician calendars
 const PHYSICIANS = {
-  dr_emery:
-    "uh7ehq6qg5c1qfdciic3v8l0s8@group.calendar.google.com",
-  dr_thompson:
-    "eburtl0ebphsp3h9qdfurpbqeg@group.calendar.google.com",
-  dr_dowding:
-    "a70ab6c4e673f04f6d40fabdb0f4861cf2fac5874677d5dd9961e357b8bb8af9@group.calendar.google.com",
-  dr_blair:
-    "ad21642079da12151a39c9a5aa455d56c306cfeabdfd712fb34a4378c3f04c4a@group.calendar.google.com",
-  dr_williams:
-    "7343219d0e34a585444e2a39fd1d9daa650e082209a9e5dc85e0ce73d63c7393@group.calendar.google.com",
-  dr_wright:
-    "b8a27f6d34e63806408f975bf729a3089b0d475b1b58c18ae903bc8bc63aa0ea@group.calendar.google.com",
-  dr_dixon:
-    "ed382c812be7a6d3396a874ca19368f2d321805f80526e6f3224f713f0637cee@group.calendar.google.com",
+  dr_emery: "uh7ehq6qg5c1qfdciic3v8l0s8@group.calendar.google.com",
+  dr_thompson: "eburtl0ebphsp3h9qdfurpbqeg@group.calendar.google.com",
+  dr_dowding: "a70ab6c4e673f04f6d40fabdb0f4861cf2fac5874677d5dd9961e357b8bb8af9@group.calendar.google.com",
+  dr_blair: "ad21642079da12151a39c9a5aa455d56c306cfeabdfd712fb34a4378c3f04c4a@group.calendar.google.com",
+  dr_williams: "7343219d0e34a585444e2a39fd1d9daa650e082209a9e5dc85e0ce73d63c7393@group.calendar.google.com",
+  dr_wright: "b8a27f6d34e63806408f975bf729a3089b0d475b1b58c18ae903bc8bc63aa0ea@group.calendar.google.com",
+  dr_dixon: "ed382c812be7a6d3396a874ca19368f2d321805f80526e6f3224f713f0637cee@group.calendar.google.com",
 };
 
 const PHYSICIAN_DISPLAY = {
@@ -116,9 +112,7 @@ const Calendar = {
     const description = [
       phone ? `Phone: ${phone}` : null,
       note ? `Note: ${note}` : null,
-    ]
-      .filter(Boolean)
-      .join("\n");
+    ].filter(Boolean).join("\n");
 
     const { data } = await calendar.events.insert({
       calendarId: id,
@@ -344,8 +338,6 @@ app.post("/telnyx/inbound", async (req, res) => {
 
     // If no answer -> voicemail
     if (eventType === "call.ended" || eventType === "transfer.failed") {
-      // Start simple voicemail record (Telnyx will send recording.saved later if configured)
-      // Here we just email that no one answered; you can expand to start/stop record via call control if needed.
       const branch = resolveBranchFromMeta(payload.client_state ? JSON.parse(Buffer.from(payload.client_state, "base64").toString("utf8")) : {});
       await sendVoicemailEmail({
         branch,
@@ -365,4 +357,20 @@ app.post("/telnyx/inbound", async (req, res) => {
 
 // ------------------------ Start --------------------------
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`WHC server listening on :${PORT}`));
+const HOST = "0.0.0.0";
+
+const server = http.createServer(app);
+
+server.listen(PORT, HOST, () => {
+  console.log(`WHC server listening on :${PORT}`);
+});
+
+// Graceful shutdown for Railway
+process.on("SIGTERM", () => {
+  console.log("Received SIGTERM, shutting down gracefully…");
+  server.close(() => {
+    console.log("HTTP server closed");
+    process.exit(0);
+  });
+  setTimeout(() => process.exit(0), 10_000).unref();
+});
