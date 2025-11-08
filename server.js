@@ -1,5 +1,5 @@
-// server.js — WHC PBX + Calendar (Retell + Telnyx + Email)
-// ---------------------------------------------------------
+// server.js — WHC PBX + Calendar (Retell + Telnyx + Email + Status Dashboard)
+// ---------------------------------------------------------------------------
 
 import http from "http";
 import express from "express";
@@ -8,12 +8,10 @@ import { google } from "googleapis";
 import axios from "axios";
 import nodemailer from "nodemailer";
 
-// -------------------------- App --------------------------
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
-// health + root (for platform probes)
 app.get("/health", (_req, res) => res.status(200).send("ok"));
 app.get("/", (_req, res) => res.status(200).send("WHC PBX running"));
 
@@ -109,19 +107,13 @@ const Calendar = {
     const auth = getJWTAuth();
     const calendar = google.calendar({ version: "v3", auth });
 
-    const description = [
-      phone ? `Phone: ${phone}` : null,
-      note ? `Note: ${note}` : null,
-    ].filter(Boolean).join("\n");
+    const description = [phone ? `Phone: ${phone}` : null, note ? `Note: ${note}` : null]
+      .filter(Boolean)
+      .join("\n");
 
     const { data } = await calendar.events.insert({
       calendarId: id,
-      requestBody: {
-        summary: summary || "Consultation",
-        description,
-        start: { dateTime: start },
-        end: { dateTime: end },
-      },
+      requestBody: { summary: summary || "Consultation", description, start: { dateTime: start }, end: { dateTime: end } },
     });
 
     return { key, id, event: data };
@@ -131,7 +123,6 @@ const Calendar = {
     const { key, id } = getCalendarIdForPhys(physician);
     const auth = getJWTAuth();
     const calendar = google.calendar({ version: "v3", auth });
-
     const { data } = await calendar.events.list({
       calendarId: id,
       timeMin: new Date().toISOString(),
@@ -139,7 +130,6 @@ const Calendar = {
       singleEvents: true,
       orderBy: "startTime",
     });
-
     return { key, id, items: data.items || [] };
   },
 
@@ -175,91 +165,67 @@ async function sendVoicemailEmail({ branch, caller, recordingUrl, transcript }) 
     <p><b>Recording:</b> <a href="${recordingUrl}">${recordingUrl}</a></p>
     ${transcript ? `<pre>${transcript}</pre>` : ""}
   `;
-  await transporter.sendMail({
-    from: FROM_EMAIL,
-    to,
-    subject: `New Voicemail - ${branch} branch`,
-    html,
-  });
+  await transporter.sendMail({ from: FROM_EMAIL, to, subject: `New Voicemail - ${branch} branch`, html });
 }
-
-// ------------------------ Calendar Routes ----------------
-app.post("/calendar/create", async (req, res) => {
-  try {
-    const { physician, start, end, summary, phone, note } = req.body || {};
-    if (!physician || !start || !end) {
-      return res.status(400).json({ ok: false, error: "physician, start, end required" });
-    }
-    const { key, event } = await Calendar.createEvent({ physician, start, end, summary, phone, note });
-    return res.json({
-      ok: true,
-      eventId: event.id,
-      htmlLink: event.htmlLink,
-      response: `Created appointment for ${PHYSICIAN_DISPLAY[key] || key}`,
-    });
-  } catch (err) {
-    console.error("[/calendar/create] error:", err?.response?.data || err.message);
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-app.get("/calendar/upcoming/:physician", async (req, res) => {
-  try {
-    const { physician } = req.params;
-    const { max } = req.query;
-    const { key, items } = await Calendar.upcoming(physician, Number(max || 10));
-    res.json({
-      ok: true,
-      physician: PHYSICIAN_DISPLAY[key] || key,
-      count: items.length,
-      events: items.map(ev => ({
-        id: ev.id,
-        summary: ev.summary,
-        start: ev.start?.dateTime || ev.start?.date,
-        end: ev.end?.dateTime || ev.end?.date,
-        link: ev.htmlLink,
-      })),
-    });
-  } catch (err) {
-    console.error("[/calendar/upcoming] error:", err?.response?.data || err.message);
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-app.post("/calendar/delete", async (req, res) => {
-  try {
-    const { physician, eventId } = req.body || {};
-    if (!physician || !eventId) return res.status(400).json({ ok: false, error: "physician and eventId required" });
-    await Calendar.deleteEvent(physician, eventId);
-    res.json({ ok: true });
-  } catch (err) {
-    console.error("[/calendar/delete] error:", err?.response?.data || err.message);
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
 
 // ------------------------ Retell Action ------------------
 app.post("/retell/action", async (req, res) => {
   try {
     const event = req.body || {};
     const action = String(event.action || "").toLowerCase();
+
     if (action.includes("book")) {
-      const r = await Calendar.createEvent({
-        physician: event.physician,
-        start: event.start,
-        end: event.end,
-        summary: event.summary,
-        phone: event.phone,
-        note: event.note,
+      const r = await Calendar.createEvent(event);
+      return res.json({
+        ok: true,
+        response: `Booked for ${PHYSICIAN_DISPLAY[r.key] || r.key}.`,
+        eventId: r.event.id,
+        htmlLink: r.event.htmlLink
       });
-      return res.json({ ok: true, response: `Booked for ${PHYSICIAN_DISPLAY[r.key] || r.key}`, eventId: r.event.id });
     }
+
     if (action.includes("next")) {
       const u = await Calendar.upcoming(event.physician, 1);
       if (!u.items.length) return res.json({ ok: true, response: "No upcoming events." });
       const first = u.items[0];
-      return res.json({ ok: true, response: `Next for ${PHYSICIAN_DISPLAY[u.key] || u.key}: ${first.summary} at ${first.start?.dateTime || first.start?.date}`, eventId: first.id });
+      return res.json({
+        ok: true,
+        response: `Next for ${PHYSICIAN_DISPLAY[u.key] || u.key}: ${first.summary} at ${first.start?.dateTime || first.start?.date}`,
+        eventId: first.id
+      });
     }
+
+    if (action.includes("transfer")) {
+      const branch = String(event.branch || "winchester").toLowerCase();
+      const to = BRANCH_NUMBERS[branch] || BRANCH_NUMBERS.winchester;
+      return res.json({
+        ok: true,
+        response: `One moment please while I connect you to our ${branch} branch.`,
+        connect: { to }
+      });
+    }
+
+    if (action.includes("message")) {
+      const branch = String(event.branch || "winchester").toLowerCase();
+      const transporter = makeTransport();
+      if (transporter) {
+        const to = BRANCH_EMAILS[branch] || BRANCH_EMAILS.winchester;
+        const subj = `[PRIORITY] ${branch} | ${event.reason || "General"} – ${event.name || "Caller"}`;
+        const html = `
+          <p><b>NEW MESSAGE – ${branch.toUpperCase()}</b></p>
+          <p><b>Caller:</b> ${event.name || "Unknown"}<br/>
+          <b>Phone:</b> ${event.phone || "Unknown"}<br/>
+          <b>Reason:</b> ${event.reason || "General"}<br/>
+          <b>Summary:</b> ${event.summary || ""}</p>
+          <p><i>Recorded by: Kimberley – AI Receptionist</i></p>`;
+        await transporter.sendMail({ from: FROM_EMAIL, to, subject: subj, html });
+      }
+      return res.json({
+        ok: true,
+        response: "Thank you. I’ll make sure this is passed along to the right team. Someone will return your call shortly."
+      });
+    }
+
     return res.json({ ok: true, response: "Ready." });
   } catch (err) {
     console.error("[/retell/action] error:", err?.response?.data || err.message);
@@ -267,110 +233,104 @@ app.post("/retell/action", async (req, res) => {
   }
 });
 
-// ------------------------ Telnyx PBX ---------------------
-// Only activate if env is present
-const TELNYX_API_KEY = process.env.TELNYX_API_KEY;
-const TELNYX_CONNECTION_ID = process.env.TELNYX_CONNECTION_ID;
-const TELNYX_OUTBOUND_CALLER_ID = process.env.TELNYX_OUTBOUND_CALLER_ID;
+// ------------------------ Status Dashboard --------------------------
 
-const telnyx = TELNYX_API_KEY
-  ? axios.create({
-      baseURL: "https://api.telnyx.com/v2/",
-      headers: { Authorization: `Bearer ${TELNYX_API_KEY}` },
-    })
-  : null;
-
-async function tx(cmd, payload) {
-  if (!telnyx) throw new Error("Telnyx not configured");
-  return telnyx.post(`call_commands/${cmd}`, payload);
+function requireStatusAuth(req, res) {
+  const must = process.env.STATUS_TOKEN;
+  if (!must) return true;
+  const token = req.query.token || req.get("x-status-token");
+  if (token === must) return true;
+  res.status(401).send("Unauthorized");
+  return false;
 }
 
-// Helper: branch resolution (default Winchester)
-function resolveBranchFromMeta(meta = {}) {
-  const m = (meta.branch || meta.forwarded_from || "").toString().toLowerCase();
-  if (m.includes("portmore")) return "portmore";
-  if (m.includes("ardenne")) return "ardenne";
-  if (m.includes("sav")) return "sav";
-  return "winchester";
-}
-
-// Telnyx Inbound Webhook
-app.post("/telnyx/inbound", async (req, res) => {
-  if (!telnyx) return res.status(200).json({ ok: true, note: "Telnyx not configured" });
+async function checkGoogleCalendar() {
   try {
-    const data = req.body?.data || {};
-    const eventType = data?.event_type;
-    const payload = data?.payload || {};
-    const callControlId = payload.call_control_id;
-
-    console.log("[Telnyx]", eventType);
-
-    // Answer & play MOH while transferring
-    if (eventType === "call.initiated") {
-      await tx("answer", { call_control_id: callControlId });
-      await tx("playback_start", {
-        call_control_id: callControlId,
-        audio_url: MOH_URL,
-        overlay: true,
-        loop: true,
-      });
-
-      // Decide branch to ring
-      const branch = resolveBranchFromMeta(payload.client_state ? JSON.parse(Buffer.from(payload.client_state, "base64").toString("utf8")) : {});
-      const target = BRANCH_NUMBERS[branch] || BRANCH_NUMBERS.winchester;
-
-      // Try branch (dual-channel: we could use transfer or dial outbound + bridge)
-      await tx("transfer", {
-        call_control_id: callControlId,
-        to: target,
-        from: TELNYX_OUTBOUND_CALLER_ID,
-        timeout_secs: Math.ceil(HANDOFF_TIMEOUT_MS / 1000),
-      });
-
-      return res.json({ ok: true });
-    }
-
-    // If branch answers, stop MOH
-    if (eventType === "call.bridged") {
-      await tx("playback_stop", { call_control_id: callControlId });
-      return res.json({ ok: true });
-    }
-
-    // If no answer -> voicemail
-    if (eventType === "call.ended" || eventType === "transfer.failed") {
-      const branch = resolveBranchFromMeta(payload.client_state ? JSON.parse(Buffer.from(payload.client_state, "base64").toString("utf8")) : {});
-      await sendVoicemailEmail({
-        branch,
-        caller: payload?.from || payload?.from_number || "Unknown",
-        recordingUrl: "(no recording in this minimal build)",
-        transcript: null,
-      });
-      return res.json({ ok: true });
-    }
-
-    res.json({ ok: true });
-  } catch (err) {
-    console.error("[/telnyx/inbound] error:", err?.response?.data || err.message);
-    res.status(200).json({ ok: true }); // acknowledge to avoid webhook retries
+    const auth = getJWTAuth();
+    await auth.getAccessToken();
+    return { ok: true, note: "Google auth OK" };
+  } catch (e) {
+    return { ok: false, note: e?.message || "Google auth failed" };
   }
+}
+
+async function checkSMTP() {
+  try {
+    const t = makeTransport();
+    if (!t) return { ok: false, note: "SMTP not configured" };
+    await t.verify();
+    return { ok: true, note: "SMTP connection OK" };
+  } catch (e) {
+    return { ok: false, note: e?.message || "SMTP verify failed" };
+  }
+}
+
+function summarizeConfig() {
+  const hasGoogleJson = !!process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
+  const hasGoogleB64 = !!process.env.GOOGLE_CREDENTIALS_B64;
+  return {
+    branch_numbers: BRANCH_NUMBERS,
+    branch_emails: BRANCH_EMAILS,
+    moh_url: MOH_URL,
+    handoff_timeout_ms: HANDOFF_TIMEOUT_MS,
+    google_creds: hasGoogleJson ? "inline JSON" : (hasGoogleB64 ? "base64" : "missing"),
+    smtp_host: process.env.SMTP_HOST || null,
+    from_email: FROM_EMAIL
+  };
+}
+
+app.get("/status.json", async (req, res) => {
+  if (!requireStatusAuth(req, res)) return;
+  const [google, smtp] = await Promise.all([checkGoogleCalendar(), checkSMTP()]);
+  res.json({
+    ok: google.ok && smtp.ok,
+    time: new Date().toISOString(),
+    uptime_seconds: Math.round(process.uptime()),
+    checks: { google, smtp },
+    config: summarizeConfig(),
+    endpoints: { health: "/health", action_server: "/retell/action", status_html: "/status" }
+  });
+});
+
+app.get("/status", async (req, res) => {
+  if (!requireStatusAuth(req, res)) return;
+  const [google, smtp] = await Promise.all([checkGoogleCalendar(), checkSMTP()]);
+  const cfg = summarizeConfig();
+  const ok = google.ok && smtp.ok;
+  const badge = (b) => b ? `<span class="ok">OK</span>` : `<span class="fail">FAIL</span>`;
+  const row = (k, v) => `<tr><td>${k}</td><td>${v ?? ""}</td></tr>`;
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`<!doctype html><html><head><meta charset="utf-8"/>
+  <title>WHC PBX Status</title>
+  <style>
+    body { font-family:system-ui, sans-serif; margin:24px; }
+    .ok{background:#ecfdf5;color:#065f46;padding:2px 8px;border-radius:999px;font-weight:600;}
+    .fail{background:#fef2f2;color:#991b1b;padding:2px 8px;border-radius:999px;font-weight:600;}
+    table{width:100%;border-collapse:collapse;}
+    td{border-bottom:1px solid #eee;padding:6px 4px;}
+  </style></head><body>
+  <h1>WHC PBX Status ${badge(ok)}</h1>
+  <p><b>Time:</b> ${new Date().toLocaleString("en-JM",{timeZone:"America/Jamaica"})}</p>
+  <p><b>Uptime:</b> ${Math.round(process.uptime())}s</p>
+  <h3>Checks</h3>
+  <table>${row("Google Calendar", `${badge(google.ok)} ${google.note}`)}${row("SMTP", `${badge(smtp.ok)} ${smtp.note}`)}</table>
+  <h3>Config</h3>
+  <table>${row("MOH URL", cfg.moh_url)}${row("Handoff Timeout (ms)", cfg.handoff_timeout_ms)}${row("Google Credentials", cfg.google_creds)}${row("SMTP Host", cfg.smtp_host)}${row("From Email", cfg.from_email)}</table>
+  <h3>Branch Numbers</h3>
+  <table>${row("Winchester", cfg.branch_numbers.winchester)}${row("Portmore", cfg.branch_numbers.portmore)}${row("Ardenne", cfg.branch_numbers.ardenne)}${row("Sav", cfg.branch_numbers.sav)}</table>
+  </body></html>`);
 });
 
 // ------------------------ Start --------------------------
 const PORT = process.env.PORT || 8080;
 const HOST = "0.0.0.0";
-
 const server = http.createServer(app);
-
-server.listen(PORT, HOST, () => {
-  console.log(`WHC server listening on :${PORT}`);
-});
-
-// Graceful shutdown for Railway
+server.listen(PORT, HOST, () => console.log(`WHC server listening on :${PORT}`));
 process.on("SIGTERM", () => {
   console.log("Received SIGTERM, shutting down gracefully…");
   server.close(() => {
     console.log("HTTP server closed");
     process.exit(0);
   });
-  setTimeout(() => process.exit(0), 10_000).unref();
+  setTimeout(() => process.exit(0), 10000).unref();
 });
