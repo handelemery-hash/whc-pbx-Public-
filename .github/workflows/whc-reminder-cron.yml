@@ -4,7 +4,7 @@ on:
   schedule:
     # 🕒 Appointment reminders (Mon–Fri 8AM–5PM JM)
     - cron: '0,30 13-22 * * 1-5'
-    # 🎂 Birthday calls (daily 9AM JM)
+    # 🎂 Birthday calls (daily 9AM JM / 14:00 UTC)
     - cron: '0 14 * * *'
   workflow_dispatch:
 
