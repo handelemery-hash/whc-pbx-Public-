@@ -1,5 +1,5 @@
-// server.js — WHC PBX + Calendar + Retell + Email + Status + Reminders + Hours Guard + Birthdays
-// -----------------------------------------------------------------------------------------------
+// server.js — WHC PBX + Calendar + Retell + Email + Status + Reminders + Hours Guard + Birthdays (enhanced)
+// ---------------------------------------------------------------------------------------------------------
 
 import http from "http";
 import express from "express";
@@ -7,6 +7,11 @@ import cors from "cors";
 import { google } from "googleapis";
 import axios from "axios";
 import nodemailer from "nodemailer";
+import dayjs from "dayjs";
+import utc from "dayjs/plugin/utc.js";
+import tz from "dayjs/plugin/timezone.js";
+dayjs.extend(utc);
+dayjs.extend(tz);
 
 // -------------------------- App --------------------------
 const app = express();
@@ -75,49 +80,38 @@ function getCalendarIdForPhys(phys) {
 }
 
 // ----------------------- Business Hours -----------------------
-// America/Jamaica (no DST). We'll gate live transfers by these hours.
 const HOURS = {
-  timezone: "America/Jamaica",
+  timezone: TZ,
   winchester: { mon_fri: ["08:30","16:30"], sat: null,               sun: null },
   ardenne:    { mon_fri: ["08:30","16:30"], sat: null,               sun: null },
   sav:        { mon_fri: ["08:30","16:30"], sat: null,               sun: null },
-  // Portmore is special: open Saturdays 10:00–14:00
   portmore:   { mon_fri: ["10:00","17:00"], sat: ["10:00","14:00"],  sun: null },
 };
-
-// Helper: parse "HH:MM" to minutes
 function hmToMin(hm){ const [h,m]=hm.split(":").map(Number); return h*60+(m||0); }
-// Helper: Jamaica local time
-function nowJM(d=new Date()){ return new Date(d.toLocaleString("en-US",{ timeZone: HOURS.timezone })); }
-function dayKeyJM(d){ return ["sun","mon","tue","wed","thu","fri","sat"][d.getDay()]; }
-
+function nowJM(d=new Date()){ return dayjs(d).tz(TZ); }
 function isOpenNow(branchRaw, d=new Date()){
   const branch = (branchRaw||"winchester").toLowerCase();
   const spec = HOURS[branch] || HOURS.winchester;
   const local = nowJM(d);
-  const day = dayKeyJM(local);
-  const minutes = local.getHours()*60 + local.getMinutes();
-
+  const day = local.day(); // 0..6
+  const minutes = local.hour()*60 + local.minute();
   let open=null, close=null;
-  if (day === "sat" && spec.sat) [open, close] = spec.sat.map(hmToMin);
-  else if (["mon","tue","wed","thu","fri"].includes(day) && spec.mon_fri) [open, close] = spec.mon_fri.map(hmToMin);
-
+  if (day===6 && spec.sat) [open, close] = spec.sat.map(hmToMin);
+  else if (day>=1 && day<=5 && spec.mon_fri) [open, close] = spec.mon_fri.map(hmToMin);
   return (open!=null && minutes>=open && minutes<=close);
 }
-
 function nextOpenString(branchRaw, from=new Date()){
   const branch = (branchRaw||"winchester").toLowerCase();
   const spec = HOURS[branch] || HOURS.winchester;
-  const base = nowJM(from);
-
+  let base = nowJM(from);
   for (let i=0;i<7;i++){
-    const d = new Date(base.getTime() + i*24*60*60*1000);
-    const day = dayKeyJM(d);
+    const d = base.add(i,'day');
+    const day = d.day();
     let window = null;
-    if (day === "sat" && spec.sat) window = spec.sat;
-    else if (["mon","tue","wed","thu","fri"].includes(day) && spec.mon_fri) window = spec.mon_fri;
+    if (day===6 && spec.sat) window = spec.sat;
+    else if (day>=1 && day<=5 && spec.mon_fri) window = spec.mon_fri;
     if (!window) continue;
-    const labelDay = i===0 ? "today" : i===1 ? "tomorrow" : d.toLocaleDateString("en-JM",{ weekday:"long" });
+    const labelDay = i===0 ? "today" : i===1 ? "tomorrow" : d.format("dddd");
     return `${labelDay} at ${window[0]}`;
   }
   return "the next business day";
@@ -125,8 +119,8 @@ function nextOpenString(branchRaw, from=new Date()){
 
 // ---------------------- Google Auth (Calendar + Sheets) -------
 function loadServiceAccountJSON() {
-  const b64 = process.env.GOOGLE_CREDENTIALS_B64;
   const inline = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
+  const b64 = process.env.GOOGLE_CREDENTIALS_B64;
   if (inline) {
     const txt = inline.trim();
     const json = JSON.parse(txt.startsWith("{") ? txt : Buffer.from(txt, "base64").toString("utf8"));
@@ -140,16 +134,13 @@ function loadServiceAccountJSON() {
   }
   throw new Error("Missing Google credentials env");
 }
-
 function getJWTAuth() {
   const creds = loadServiceAccountJSON();
   return new google.auth.JWT(
-    creds.client_email,
-    null,
-    creds.private_key,
+    creds.client_email, null, creds.private_key,
     [
       "https://www.googleapis.com/auth/calendar",
-      "https://www.googleapis.com/auth/spreadsheets" // <-- NEW (for birthdays in Sheets)
+      "https://www.googleapis.com/auth/spreadsheets"
     ]
   );
 }
@@ -163,14 +154,10 @@ function makeTransport() {
   if (!host || !user || !pass) return null;
   return nodemailer.createTransport({ host, port, secure: port === 465, auth: { user, pass } });
 }
-
 async function sendVoicemailEmail({ branch, caller, recordingUrl, transcript }) {
   const to = BRANCH_EMAILS[branch] || BRANCH_EMAILS.winchester;
   const transporter = makeTransport();
-  if (!transporter) {
-    console.warn("[Email] SMTP not configured; skipping voicemail email");
-    return;
-  }
+  if (!transporter) { console.warn("[Email] SMTP not configured; skipping voicemail email"); return; }
   const html = `
     <p><b>New voicemail</b> for <b>${branch}</b></p>
     <p><b>From:</b> ${caller || "Unknown"}</p>
@@ -186,10 +173,8 @@ const RETELL_AGENT_ID = process.env.RETELL_AGENT_ID;
 const RETELL_NUMBER   = process.env.RETELL_NUMBER;
 
 function toISOish(dt) {
-  try { return new Date(dt).toISOString().replace(/\.\d{3}Z$/, "Z"); }
-  catch { return dt; }
+  try { return new Date(dt).toISOString().replace(/\.\d{3}Z$/, "Z"); } catch { return dt; }
 }
-
 async function callPatient({ phone, patientName, apptTime, branch, callType }) {
   if (!RETELL_API_KEY || !RETELL_AGENT_ID || !RETELL_NUMBER) {
     console.warn("[Retell] Missing RETELL_* env vars, skipping outbound call");
@@ -205,12 +190,12 @@ async function callPatient({ phone, patientName, apptTime, branch, callType }) {
         patient_name: patientName || "Patient",
         appointment_time: toISOish(apptTime),
         branch: branch || "winchester",
-        call_type: callType || "reminder"   // "reminder"|"followup"|"birthday"
+        call_type: callType || "reminder"
       }
     },
     { headers: { Authorization: `Bearer ${RETELL_API_KEY}` }, timeout: 10000 }
   );
-  return r.data;
+  return r.data || { ok: true };
 }
 
 // ------------------- Reminder helpers -------------------
@@ -229,10 +214,10 @@ function dueWindowsFor(startISO) {
 }
 // Only place calls during daytime hours in Jamaica (Mon–Sat 09:00–18:00)
 function shouldCallNow() {
-  const d  = new Date();
-  const hour = Number(d.toLocaleString("en-GB", { timeZone: TZ, hour: "2-digit", hour12: false }));
-  const dow  = d.toLocaleString("en-GB", { timeZone: TZ, weekday: "short" }); // Mon..Sun
-  if (dow === "Sun") return false;
+  const d  = dayjs().tz(TZ);
+  const hour = d.hour();
+  const dow  = d.day(); // 0=Sun
+  if (dow === 0) return false;
   return hour >= 9 && hour <= 18;
 }
 
@@ -294,13 +279,37 @@ const Calendar = {
 // -------------------- Birthdays (Google Sheets) ---------
 const BIRTHDAYS_SHEET_ID = process.env.BIRTHDAYS_SHEET_ID;
 
-async function readBirthdays() {
+// Header cache for column mapping
+let BDAY_HDR = null;
+async function getBirthdayHeader() {
+  if (BDAY_HDR) return BDAY_HDR;
+  const auth = getJWTAuth();
+  const sheets = google.sheets({ version: "v4", auth });
+  const { data } = await sheets.spreadsheets.values.get({
+    spreadsheetId: BIRTHDAYS_SHEET_ID,
+    range: "Sheet1!A1:Z1"
+  });
+  BDAY_HDR = (data.values && data.values[0]) || [];
+  return BDAY_HDR;
+}
+function colIdxToA1(idx) {
+  // 0 -> A, 1 -> B ...
+  let n = idx + 1, s = "";
+  while (n > 0) {
+    const r = (n - 1) % 26;
+    s = String.fromCharCode(65 + r) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
+}
+
+async function readBirthdaySheet() {
   if (!BIRTHDAYS_SHEET_ID) return [];
   const auth = getJWTAuth();
   const sheets = google.sheets({ version: "v4", auth });
   const { data } = await sheets.spreadsheets.values.get({
     spreadsheetId: BIRTHDAYS_SHEET_ID,
-    range: "Sheet1!A:F" // full_name, phone_e164, dob_yyyy_mm_dd, branch, opt_out, last_called_year
+    range: "Sheet1!A:Z"
   });
   const rows = data.values || [];
   const header = rows.shift() || [];
@@ -309,30 +318,77 @@ async function readBirthdays() {
   for (let r = 0; r < rows.length; r++) {
     const row = rows[r];
     out.push({
-      _row: r + 2, // 1-based (header is row 1)
+      rowIndex: r + 2,
       full_name: row[idx("full_name")] || "",
       phone_e164: row[idx("phone_e164")] || "",
-      dob: row[idx("dob_yyyy_mm_dd")] || "",
+      dob_yyyy_mm_dd: row[idx("dob_yyyy_mm_dd")] || "",
       branch: (row[idx("branch")] || "winchester").toLowerCase(),
       opt_out: (row[idx("opt_out")] || "").trim(),
+      opt_out_reason: (row[idx("opt_out_reason")] || "").trim(),
       last_called_year: (row[idx("last_called_year")] || "").trim(),
+      last_outcome: (row[idx("last_outcome")] || "").trim(),
+      last_outcome_ts: (row[idx("last_outcome_ts")] || "").trim(),
+      deferred_for_yyyy_mm_dd: (row[idx("deferred_for_yyyy_mm_dd")] || "").trim(),
+      deferred_reason: (row[idx("deferred_reason")] || "").trim(),
+      dob_correction: (row[idx("dob_correction")] || "").trim(),
+      new_phone_candidate: (row[idx("new_phone_candidate")] || "").trim(),
+      status_flag: (row[idx("status_flag")] || "").trim(),
+      status_note: (row[idx("status_note")] || "").trim(),
+      preferred_contact: (row[idx("preferred_contact")] || "").trim(),
+      caregiver_name: (row[idx("caregiver_name")] || "").trim(),
+      caregiver_phone: (row[idx("caregiver_phone")] || "").trim(),
+      pause_until_yyyy_mm_dd: (row[idx("pause_until_yyyy_mm_dd")] || "").trim(),
     });
   }
   return out;
 }
 
-async function writeLastCalledYear(rowsToUpdate, year) {
-  if (!BIRTHDAYS_SHEET_ID || !rowsToUpdate.length) return;
+async function writeBirthdayRow(rowIndex, patch) {
+  if (!BIRTHDAYS_SHEET_ID || !rowIndex || !patch) return;
+  const header = await getBirthdayHeader();
   const auth = getJWTAuth();
   const sheets = google.sheets({ version: "v4", auth });
-  const data = rowsToUpdate.map(r => ({
-    range: `Sheet1!F${r._row}`, // column F = last_called_year
-    values: [[String(year)]],
-  }));
+
+  const data = [];
+  for (const [key, value] of Object.entries(patch)) {
+    const col = header.indexOf(key);
+    if (col === -1) continue; // unknown key
+    const a1 = `${colIdxToA1(col)}${rowIndex}`;
+    data.push({ range: `Sheet1!${a1}`, values: [[value ?? ""]] });
+  }
+  if (!data.length) return;
   await sheets.spreadsheets.values.batchUpdate({
     spreadsheetId: BIRTHDAYS_SHEET_ID,
     requestBody: { data, valueInputOption: "RAW" },
   });
+}
+
+async function findBirthdayRowByPhoneOrName(phone, name) {
+  const rows = await readBirthdaySheet();
+  const p = String(phone || "").replace(/\s+/g, "");
+  let row = rows.find(r => (r.phone_e164 || "").replace(/\s+/g, "") === p);
+  if (!row && name) {
+    const n = String(name).toLowerCase().trim();
+    row = rows.find(r => String(r.full_name || "").toLowerCase().trim() === n);
+  }
+  return row || null;
+}
+
+// ---- Jamaica 2025 public holidays (simple set; optional to expand) ----
+const JM_HOLIDAYS_2025 = new Set([
+  "2025-01-01","2025-02-26","2025-04-18","2025-04-21","2025-05-23",
+  "2025-08-01","2025-10-20","2025-12-25","2025-12-26"
+]);
+function isSunday(d) { return dayjs.tz(d, TZ).day() === 0; }
+function isHoliday(d) { return JM_HOLIDAYS_2025.has(dayjs.tz(d, TZ).format("YYYY-MM-DD")); }
+function isOpenBusinessDay(d) {
+  const dj = dayjs.tz(d, TZ);
+  return dj.day() !== 0 && !isHoliday(dj);
+}
+function nextBusinessDay(d) {
+  let dj = dayjs.tz(d, TZ).add(1, "day");
+  while (!isOpenBusinessDay(dj)) dj = dj.add(1, "day");
+  return dj.format("YYYY-MM-DD");
 }
 
 // ------------------------ Retell Action ------------------
@@ -343,7 +399,7 @@ app.post("/retell/action", async (req, res) => {
     const action = String(event.action || "").toLowerCase();
     const branch = String(event.branch || "winchester").toLowerCase();
 
-    // Allow a secure testing override of the after-hours guard
+    // testing override
     const tokenOk =
       !process.env.STATUS_TOKEN ||
       req.query.token === process.env.STATUS_TOKEN ||
@@ -351,7 +407,7 @@ app.post("/retell/action", async (req, res) => {
     const forceOpen =
       tokenOk && (req.query.force_open === "1" || event.force_open === true);
 
-    // --- GLOBAL AFTER-HOURS GUARD ---
+    // After-hours guard for human transfers
     const wantsHuman =
       action.includes("transfer") ||
       action.includes("route") ||
@@ -365,8 +421,6 @@ app.post("/retell/action", async (req, res) => {
         response: `Thank you for holding. Our ${branch} office is currently closed. I can take your name, number, and a brief message for the team to return your call ${nextOpen}. Would you like me to do that now?`
       });
     }
-
-    // --- ACTIONS ---
 
     // BOOK (allowed anytime)
     if (action.includes("book")) {
@@ -401,7 +455,7 @@ app.post("/retell/action", async (req, res) => {
       });
     }
 
-    // HOURS query (optional)
+    // HOURS query
     if (action.includes("hours")) {
       const open = isOpenNow(branch);
       if (branch === "portmore") {
@@ -420,11 +474,11 @@ app.post("/retell/action", async (req, res) => {
       });
     }
 
-    // TRANSFER (Retell performs bridge) — within business hours (global guard handles closed)
+    // TRANSFER (Retell performs bridge)
     if (action.includes("transfer")) {
       const to = BRANCH_NUMBERS[branch] || BRANCH_NUMBERS.winchester;
       const open = isOpenNow(branch);
-      console.log(`[Transfer] action=transfer branch=${branch} to=${to} open=${open} at=${new Date().toLocaleString("en-JM",{timeZone:"America/Jamaica"})}`);
+      console.log(`[Transfer] action=transfer branch=${branch} to=${to} open=${open} at=${dayjs().tz(TZ).format("YYYY-MM-DD HH:mm:ss")}`);
       return res.json({
         ok: true,
         response: `One moment please while I connect you to our ${branch} branch.`,
@@ -437,10 +491,11 @@ app.post("/retell/action", async (req, res) => {
     if (action.includes("message")) {
       const transporter = makeTransport();
       if (transporter) {
-        const to = BRANCH_EMAILS[branch] || BRANCH_EMAILS.winchester;
-        const subj = `[PRIORITY] ${branch} | ${event.reason || "General"} – ${event.name || "Caller"}`;
+        const b = branch || "winchester";
+        const to = BRANCH_EMAILS[b] || BRANCH_EMAILS.winchester;
+        const subj = `[PRIORITY] ${b} | ${event.reason || "General"} – ${event.name || "Caller"}`;
         const html = `
-          <p><b>NEW MESSAGE – ${branch.toUpperCase()}</b></p>
+          <p><b>NEW MESSAGE – ${b.toUpperCase()}</b></p>
           <p><b>Caller:</b> ${event.name || "Unknown"}<br/>
           <b>Phone:</b> ${event.phone || "Unknown"}<br/>
           <b>Reason:</b> ${event.reason || "General"}<br/>
@@ -459,6 +514,112 @@ app.post("/retell/action", async (req, res) => {
       });
     }
 
+    // -------- Birthday maintenance actions --------
+    if (action === "update_dob" || action === "dob_update") {
+      const phone = event?.patient?.phone || event.phone;
+      const name  = event?.patient?.full_name || event.patient_name;
+      const newDob = event.dob; // YYYY-MM-DD
+      if (!phone || !newDob) return res.json({ ok: false, response: "Missing phone or DOB." });
+
+      const row = await findBirthdayRowByPhoneOrName(phone, name);
+      if (!row) return res.json({ ok: false, response: "Patient not found in birthday list." });
+
+      await writeBirthdayRow(row.rowIndex, {
+        dob_correction: newDob,
+        last_outcome: "corrected_dob",
+        last_outcome_ts: dayjs().tz(TZ).toISOString(),
+        status_flag: "needs_review",
+        status_note: "DOB correction submitted by Kimberley"
+      });
+
+      // optional email to branch
+      try {
+        const t = makeTransport();
+        const to = BRANCH_EMAILS[row.branch] || BRANCH_EMAILS.winchester;
+        await t?.sendMail({
+          from: FROM_EMAIL, to,
+          subject: `DOB correction submitted – ${row.full_name}`,
+          html: `<p>Kimberley captured a DOB correction.</p>
+                 <p><b>Patient:</b> ${row.full_name} (${row.phone_e164})</p>
+                 <p><b>New DOB:</b> ${newDob}</p>
+                 <p>Please verify and update <b>dob_yyyy_mm_dd</b> in the sheet, then clear <b>dob_correction</b>.</p>`
+        });
+      } catch {}
+      return res.json({ ok: true, response: "Thanks — I’ve sent that update to our team." });
+    }
+
+    if (action === "mark_wrong_number") {
+      const phone = event?.patient?.phone || event.phone;
+      const name  = event?.patient?.full_name || event.patient_name;
+      const row = await findBirthdayRowByPhoneOrName(phone, name);
+      if (!row) return res.json({ ok: false, response: "Record not found." });
+
+      await writeBirthdayRow(row.rowIndex, {
+        opt_out: "yes",
+        opt_out_reason: "wrong_number",
+        status_flag: "wrong_number",
+        status_note: "Marked by Kimberley",
+        last_outcome: "wrong_number",
+        last_outcome_ts: dayjs().tz(TZ).toISOString()
+      });
+      return res.json({ ok: true, response: "Noted. We won’t call this number again." });
+    }
+
+    if (action === "mark_deceased") {
+      const phone = event?.patient?.phone || event.phone;
+      const name  = event?.patient?.full_name || event.patient_name;
+      const row = await findBirthdayRowByPhoneOrName(phone, name);
+      if (!row) return res.json({ ok: false, response: "Record not found." });
+
+      await writeBirthdayRow(row.rowIndex, {
+        opt_out: "yes",
+        opt_out_reason: "deceased",
+        status_flag: "deceased",
+        status_note: "Marked by Kimberley",
+        last_outcome: "deceased",
+        last_outcome_ts: dayjs().tz(TZ).toISOString()
+      });
+      return res.json({ ok: true, response: "Our sincere condolences. We’ve updated our records." });
+    }
+
+    if (action === "opt_out") {
+      const phone = event?.patient?.phone || event.phone;
+      const name  = event?.patient?.full_name || event.patient_name;
+      const reason = event.reason || "request";
+      const row = await findBirthdayRowByPhoneOrName(phone, name);
+      if (!row) return res.json({ ok: false, response: "Record not found." });
+
+      await writeBirthdayRow(row.rowIndex, {
+        opt_out: "yes",
+        opt_out_reason: reason,
+        last_outcome: "opt_out",
+        last_outcome_ts: dayjs().tz(TZ).toISOString()
+      });
+      return res.json({ ok: true, response: "Understood. We’ll stop calls to this number." });
+    }
+
+    if (action === "update_contact") {
+      const phone = event?.patient?.phone || event.phone;
+      const name  = event?.patient?.full_name || event.patient_name;
+      const newPhone = event.new_phone_candidate || event.new_phone;
+      const caregiverName  = event.caregiver_name || "";
+      const caregiverPhone = event.caregiver_phone || "";
+      const row = await findBirthdayRowByPhoneOrName(phone, name);
+      if (!row) return res.json({ ok: false, response: "Record not found." });
+
+      await writeBirthdayRow(row.rowIndex, {
+        new_phone_candidate: newPhone || "",
+        caregiver_name: caregiverName,
+        caregiver_phone: caregiverPhone,
+        status_flag: "needs_review",
+        status_note: "New contact info submitted by Kimberley",
+        last_outcome: "contact_update",
+        last_outcome_ts: dayjs().tz(TZ).toISOString()
+      });
+      return res.json({ ok: true, response: "Thank you, I’ve noted the updated contact details." });
+    }
+
+    // default
     return res.json({ ok: true, response: "Ready." });
   } catch (err) {
     console.error("[/retell/action] error:", err?.response?.data || err.message);
@@ -469,34 +630,20 @@ app.post("/retell/action", async (req, res) => {
 // ------------------------ Status Dashboard --------------------------
 function requireStatusAuth(req, res) {
   const must = process.env.STATUS_TOKEN;
-  if (!must) return true; // public if no token is set
+  if (!must) return true;
   const token = req.query.token || req.get("x-status-token");
   if (token === must) return true;
   res.status(401).send("Unauthorized");
   return false;
 }
-
 async function checkGoogleCalendar() {
-  try {
-    const auth = getJWTAuth();
-    await auth.getAccessToken();
-    return { ok: true, note: "Google auth OK" };
-  } catch (e) {
-    return { ok: false, note: e?.message || "Google auth failed" };
-  }
+  try { const auth = getJWTAuth(); await auth.getAccessToken(); return { ok: true, note: "Google auth OK" }; }
+  catch (e) { return { ok: false, note: e?.message || "Google auth failed" }; }
 }
-
 async function checkSMTP() {
-  try {
-    const t = makeTransport();
-    if (!t) return { ok: false, note: "SMTP not configured" };
-    await t.verify();
-    return { ok: true, note: "SMTP connection OK" };
-  } catch (e) {
-    return { ok: false, note: e?.message || "SMTP verify failed" };
-  }
+  try { const t = makeTransport(); if (!t) return { ok: false, note: "SMTP not configured" }; await t.verify(); return { ok: true, note: "SMTP connection OK" }; }
+  catch (e) { return { ok: false, note: e?.message || "SMTP verify failed" }; }
 }
-
 function summarizeConfig() {
   const hasGoogleJson = !!process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
   const hasGoogleB64 = !!process.env.GOOGLE_CREDENTIALS_B64;
@@ -511,7 +658,6 @@ function summarizeConfig() {
     birthdays_sheet_id: BIRTHDAYS_SHEET_ID ? "set" : "missing"
   };
 }
-
 app.get("/status.json", async (req, res) => {
   if (!requireStatusAuth(req, res)) return;
   const [google, smtp] = await Promise.all([checkGoogleCalendar(), checkSMTP()]);
@@ -524,7 +670,6 @@ app.get("/status.json", async (req, res) => {
     endpoints: { health: "/health", action_server: "/retell/action", status_html: "/status" }
   });
 });
-
 app.get("/status", async (req, res) => {
   if (!requireStatusAuth(req, res)) return;
   const [google, smtp] = await Promise.all([checkGoogleCalendar(), checkSMTP()]);
@@ -544,7 +689,7 @@ app.get("/status", async (req, res) => {
     h3{margin-top:24px;}
   </style></head><body>
   <h1>WHC PBX Status ${badge(ok)}</h1>
-  <p><b>Time:</b> ${new Date().toLocaleString("en-JM",{timeZone:"America/Jamaica"})}</p>
+  <p><b>Time:</b> ${dayjs().tz(TZ).format("YYYY-MM-DD HH:mm:ss")}</p>
   <p><b>Uptime:</b> ${Math.round(process.uptime())}s</p>
   <h3>Checks</h3>
   <table>${row("Google Calendar", `${badge(google.ok)} ${google.note}`)}${row("SMTP", `${badge(smtp.ok)} ${smtp.note}`)}</table>
@@ -585,7 +730,6 @@ app.post("/jobs/run-reminders", async (req, res) => {
         const startISO = ev.start?.dateTime || ev.start?.date;
         if (!startISO) continue;
 
-        // patient data
         const priv = ev.extendedProperties?.private || {};
         const patientName  = priv.patient_name || null;
         const patientPhone = priv.patient_phone || null;
@@ -642,47 +786,86 @@ app.post("/jobs/run-reminders", async (req, res) => {
   }
 });
 
-// --------------- Scheduled Job: birthday calls ---------------
+// --------------- Scheduled Job: birthday calls (with deferral) ---------------
 app.post("/jobs/run-birthdays", async (req, res) => {
   try {
     const must = process.env.STATUS_TOKEN;
     const token = req.query.token || req.get("x-status-token");
     if (must && token !== must) return res.status(401).json({ ok: false, error: "Unauthorized" });
 
-    if (!shouldCallNow()) {
-      return res.json({ ok: true, note: "Outside calling window; skipped birthdays." });
+    const today = dayjs().tz(TZ);
+    const todayIso = today.format("YYYY-MM-DD");
+    const todayMMDD = today.format("MM-DD");
+    const thisYear = today.year();
+
+    const rows = await readBirthdaySheet();
+    const clean = (s) => String(s || "").trim();
+
+    // Closed day (Sunday/holiday): mark deferrals and exit
+    if (!isOpenBusinessDay(today)) {
+      const toDefer = rows.filter(r =>
+        clean(r.dob_yyyy_mm_dd).slice(5) === todayMMDD &&
+        !clean(r.opt_out) &&
+        clean(r.last_called_year) !== String(thisYear)
+      );
+      const carryTo = toDefer.length ? nextBusinessDay(today) : null;
+      for (const r of toDefer) {
+        await writeBirthdayRow(r.rowIndex, {
+          deferred_for_yyyy_mm_dd: carryTo,
+          deferred_reason: isSunday(today) ? "sunday" : "holiday",
+          last_outcome: "deferred",
+          last_outcome_ts: today.toISOString()
+        });
+      }
+      return res.json({ ok: true, closed_today: true, deferred: toDefer.length, carry_to: carryTo });
     }
 
-    const now = new Date(new Date().toLocaleString("en-US", { timeZone: TZ }));
-    const yyyy = now.getFullYear();
-    const mm = String(now.getMonth() + 1).padStart(2, "0");
-    const dd = String(now.getDate()).padStart(2, "0");
-    const todayMD = `${mm}-${dd}`;
-
-    const rows = await readBirthdays();
-    const toCall = rows.filter(r => {
-      if (r.opt_out) return false;
-      const md = (r.dob || "").slice(5, 10); // MM-DD
-      if (md !== todayMD) return false;
-      if (!r.phone_e164) return false;
-      if (r.last_called_year === String(yyyy)) return false; // already called this year
-      return true;
+    // Open day: due = (today's birthdays OR deferred to today), not opted out, not already called this year, not paused
+    const due = rows.filter(r => {
+      const mmdd = clean(r.dob_yyyy_mm_dd).slice(5);
+      const deferredFor = clean(r.deferred_for_yyyy_mm_dd);
+      const notCalledThisYear = clean(r.last_called_year) !== String(thisYear);
+      const ok = !clean(r.opt_out);
+      const paused = !!clean(r.pause_until_yyyy_mm_dd) && dayjs.tz(r.pause_until_yyyy_mm_dd, TZ).isAfter(today, "day");
+      return ok && !paused && notCalledThisYear && (mmdd === todayMMDD || deferredFor === todayIso);
     });
 
-    let placed = 0;
-    for (const r of toCall) {
-      await callPatient({
-        phone: r.phone_e164,
-        patientName: r.full_name || "Patient",
-        apptTime: now.toISOString(),      // placeholder
-        branch: r.branch || "winchester",
-        callType: "birthday"              // NEW: birthday script
-      });
-      placed++;
+    // Respect calling hours inside the open day
+    if (!shouldCallNow()) {
+      return res.json({ ok: true, note: "Outside calling hours; will try later today.", candidates: due.length });
     }
 
-    if (placed) await writeLastCalledYear(toCall, yyyy);
-    return res.json({ ok: true, scanned: rows.length, birthdays_today: toCall.length, calls_placed: placed });
+    let placed = 0;
+    for (const r of due) {
+      try {
+        const resp = await callPatient({
+          phone: r.phone_e164,
+          patientName: r.full_name,
+          branch: r.branch,
+          callType: "birthday",
+        });
+        placed++;
+        await writeBirthdayRow(r.rowIndex, {
+          last_called_year: String(thisYear),
+          last_outcome: "success",
+          last_outcome_ts: today.toISOString(),
+          deferred_for_yyyy_mm_dd: "",
+          deferred_reason: "",
+          status_note: ""
+        });
+      } catch (err) {
+        // soft retry next business day
+        await writeBirthdayRow(r.rowIndex, {
+          last_outcome: "failed",
+          last_outcome_ts: today.toISOString(),
+          deferred_for_yyyy_mm_dd: nextBusinessDay(today),
+          deferred_reason: "retry",
+          status_note: "Retry next business day"
+        });
+      }
+    }
+
+    return res.json({ ok: true, birthdays_due: due.length, calls_placed: placed });
   } catch (e) {
     console.error("[/jobs/run-birthdays]", e.response?.data || e.message);
     res.status(500).json({ ok: false, error: e.message });
