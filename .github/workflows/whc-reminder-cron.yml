@@ -1,0 +1,21 @@
+name: WHC Reminder Job
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # every 15 minutes (UTC)
+  workflow_dispatch:         # allow manual run
+
+jobs:
+  run-reminders:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Trigger reminders endpoint
+        run: |
+          set -euo pipefail
+          # Hit your Railway endpoint (POST) with the STATUS_TOKEN
+          curl --fail --show-error --silent -X POST \
+            "https://gallant-reverence-production.up.railway.app/jobs/run-reminders?token=${{ secrets.STATUS_TOKEN }}"
+      - name: Show time (for logs)
+        run: |
+          echo "Ran at (UTC): $(date -u +"%Y-%m-%d %H:%M:%S")"
