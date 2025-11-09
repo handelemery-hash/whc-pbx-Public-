@@ -1,5 +1,5 @@
-// server.js — WHC PBX + Calendar + Retell + Email + Status + Reminders
-// --------------------------------------------------------------------
+// server.js — WHC PBX + Calendar + Retell + Email + Status + Reminders + Hours Guard
+// -----------------------------------------------------------------------------------
 
 import http from "http";
 import express from "express";
@@ -72,6 +72,55 @@ function getCalendarIdForPhys(phys) {
   const id = PHYSICIANS[key];
   if (!id) throw new Error(`Unknown physician '${phys}'`);
   return { key, id };
+}
+
+// ----------------------- Business Hours -----------------------
+// America/Jamaica (no DST). We'll gate live transfers by these hours.
+const HOURS = {
+  timezone: "America/Jamaica",
+  winchester: { mon_fri: ["08:30","16:30"], sat: null,               sun: null },
+  ardenne:    { mon_fri: ["08:30","16:30"], sat: null,               sun: null },
+  sav:        { mon_fri: ["08:30","16:30"], sat: null,               sun: null },
+  // Portmore is special: open Saturdays 10:00–14:00
+  portmore:   { mon_fri: ["10:00","17:00"], sat: ["10:00","14:00"],  sun: null },
+};
+
+// Helper: parse "HH:MM" to minutes
+function hmToMin(hm){ const [h,m]=hm.split(":").map(Number); return h*60+(m||0); }
+// Helper: Jamaica local time
+function nowJM(d=new Date()){ return new Date(d.toLocaleString("en-US",{ timeZone: HOURS.timezone })); }
+function dayKeyJM(d){ return ["sun","mon","tue","wed","thu","fri","sat"][d.getDay()]; }
+
+function isOpenNow(branchRaw, d=new Date()){
+  const branch = (branchRaw||"winchester").toLowerCase();
+  const spec = HOURS[branch] || HOURS.winchester;
+  const local = nowJM(d);
+  const day = dayKeyJM(local);
+  const minutes = local.getHours()*60 + local.getMinutes();
+
+  let open=null, close=null;
+  if (day === "sat" && spec.sat) [open, close] = spec.sat.map(hmToMin);
+  else if (["mon","tue","wed","thu","fri"].includes(day) && spec.mon_fri) [open, close] = spec.mon_fri.map(hmToMin);
+
+  return (open!=null && minutes>=open && minutes<=close);
+}
+
+function nextOpenString(branchRaw, from=new Date()){
+  const branch = (branchRaw||"winchester").toLowerCase();
+  const spec = HOURS[branch] || HOURS.winchester;
+  const base = nowJM(from);
+
+  for (let i=0;i<7;i++){
+    const d = new Date(base.getTime() + i*24*60*60*1000);
+    const day = dayKeyJM(d);
+    let window = null;
+    if (day === "sat" && spec.sat) window = spec.sat;
+    else if (["mon","tue","wed","thu","fri"].includes(day) && spec.mon_fri) window = spec.mon_fri;
+    if (!window) continue;
+    const labelDay = i===0 ? "today" : i===1 ? "tomorrow" : d.toLocaleDateString("en-JM",{ weekday:"long" });
+    return `${labelDay} at ${window[0]}`;
+  }
+  return "the next business day";
 }
 
 // ---------------------- Google Calendar ------------------
@@ -153,7 +202,7 @@ async function callPatient({ phone, patientName, apptTime, branch, callType }) {
         patient_name: patientName || "Patient",
         appointment_time: toISOish(apptTime),
         branch: branch || "winchester",
-        call_type: callType || "reminder"   // <-- tells the agent which script to use
+        call_type: callType || "reminder"   // tells the agent which script to use
       }
     },
     { headers: { Authorization: `Bearer ${RETELL_API_KEY}` }, timeout: 10000 }
@@ -240,12 +289,34 @@ const Calendar = {
 };
 
 // ------------------------ Retell Action ------------------
+// Global after-hours guard: booking allowed anytime; transfer/route after-hours => message-taking.
 app.post("/retell/action", async (req, res) => {
   try {
     const event = req.body || {};
     const action = String(event.action || "").toLowerCase();
+    const branch = String(event.branch || "winchester").toLowerCase();
 
-    // BOOK
+    // --- GLOBAL AFTER-HOURS GUARD ---
+    // If it's a request to *speak to someone / route / transfer* and we're closed,
+    // do NOT connect; ask to take a message instead (booking still allowed any time).
+    const wantsHuman =
+      action.includes("transfer") ||
+      action.includes("route") ||
+      action.includes("route_human") ||
+      action.includes("connect");
+
+    if (wantsHuman && !isOpenNow(branch)) {
+      const nextOpen = nextOpenString(branch);
+      return res.json({
+        ok: true,
+        response: `Thank you for holding. Our ${branch} office is currently closed. I can take your name, number, and a brief message for the team to return your call ${nextOpen}. Would you like me to do that now?`
+        // No "connect" object => Retell will not attempt a bridge.
+      });
+    }
+
+    // --- ACTIONS ---
+
+    // BOOK (allowed anytime)
     if (action.includes("book")) {
       const r = await Calendar.createEvent({
         physician: event.physician,
@@ -278,9 +349,27 @@ app.post("/retell/action", async (req, res) => {
       });
     }
 
-    // TRANSFER (Retell performs bridge)
+    // HOURS query support (optional): say open/closed and next opening
+    if (action.includes("hours")) {
+      const open = isOpenNow(branch);
+      if (branch === "portmore") {
+        return res.json({
+          ok: true,
+          response: open
+            ? "Yes, our Portmore office is currently open: Monday to Friday 10 AM to 5 PM, and Saturdays 10 AM to 2 PM."
+            : `We’re currently closed. Portmore hours are Monday to Friday 10 AM to 5 PM, and Saturdays 10 AM to 2 PM. We’ll reopen ${nextOpenString(branch)}.`
+        });
+      }
+      return res.json({
+        ok: true,
+        response: open
+          ? `Yes, our ${branch} office is open: Monday to Friday 8:30 AM to 4:30 PM.`
+          : `We’re currently closed. ${branch} hours are Monday to Friday 8:30 AM to 4:30 PM. We’ll reopen ${nextOpenString(branch)}.`
+      });
+    }
+
+    // TRANSFER (Retell performs bridge) — only within business hours (global guard already handles closed case)
     if (action.includes("transfer")) {
-      const branch = String(event.branch || "winchester").toLowerCase();
       const to = BRANCH_NUMBERS[branch] || BRANCH_NUMBERS.winchester;
       return res.json({
         ok: true,
@@ -292,7 +381,6 @@ app.post("/retell/action", async (req, res) => {
 
     // MESSAGE (email summary to branch inbox)
     if (action.includes("message")) {
-      const branch = String(event.branch || "winchester").toLowerCase();
       const transporter = makeTransport();
       if (transporter) {
         const to = BRANCH_EMAILS[branch] || BRANCH_EMAILS.winchester;
@@ -460,7 +548,7 @@ app.post("/jobs/run-reminders", async (req, res) => {
               patientName,
               apptTime: startISO,
               branch,
-              callType: "reminder" // <-- tag
+              callType: "reminder"
             });
             priv[flag] = "true";
             actions++; changed = true;
@@ -476,7 +564,7 @@ app.post("/jobs/run-reminders", async (req, res) => {
             patientName,
             apptTime: startISO,
             branch,
-            callType: "followup" // <-- tag
+            callType: "followup"
           });
           priv.followup_1d = "true";
           actions++; changed = true;
