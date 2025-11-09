@@ -1,5 +1,5 @@
-// server.js — WHC PBX + Calendar + Retell + Email + Status + Reminders + Hours Guard
-// -----------------------------------------------------------------------------------
+// server.js — WHC PBX + Calendar + Retell + Email + Status + Reminders + Hours Guard + Birthdays
+// -----------------------------------------------------------------------------------------------
 
 import http from "http";
 import express from "express";
@@ -123,19 +123,19 @@ function nextOpenString(branchRaw, from=new Date()){
   return "the next business day";
 }
 
-// ---------------------- Google Calendar ------------------
+// ---------------------- Google Auth (Calendar + Sheets) -------
 function loadServiceAccountJSON() {
   const b64 = process.env.GOOGLE_CREDENTIALS_B64;
   const inline = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
   if (inline) {
     const txt = inline.trim();
     const json = JSON.parse(txt.startsWith("{") ? txt : Buffer.from(txt, "base64").toString("utf8"));
-    console.log("✅ [Calendar] Loaded credentials from GOOGLE_APPLICATION_CREDENTIALS_JSON");
+    console.log("✅ [Google] Loaded credentials from GOOGLE_APPLICATION_CREDENTIALS_JSON");
     return json;
   }
   if (b64) {
     const json = JSON.parse(Buffer.from(b64, "base64").toString("utf8"));
-    console.log("✅ [Calendar] Loaded credentials from GOOGLE_CREDENTIALS_B64");
+    console.log("✅ [Google] Loaded credentials from GOOGLE_CREDENTIALS_B64");
     return json;
   }
   throw new Error("Missing Google credentials env");
@@ -147,7 +147,10 @@ function getJWTAuth() {
     creds.client_email,
     null,
     creds.private_key,
-    ["https://www.googleapis.com/auth/calendar"]
+    [
+      "https://www.googleapis.com/auth/calendar",
+      "https://www.googleapis.com/auth/spreadsheets" // <-- NEW (for birthdays in Sheets)
+    ]
   );
 }
 
@@ -177,7 +180,7 @@ async function sendVoicemailEmail({ branch, caller, recordingUrl, transcript }) 
   await transporter.sendMail({ from: FROM_EMAIL, to, subject: `New Voicemail - ${branch} branch`, html });
 }
 
-// ------------------- Retell Outbound (reminders) --------
+// ------------------- Retell Outbound (reminders etc.) ---
 const RETELL_API_KEY = process.env.RETELL_API_KEY;
 const RETELL_AGENT_ID = process.env.RETELL_AGENT_ID;
 const RETELL_NUMBER   = process.env.RETELL_NUMBER;
@@ -202,7 +205,7 @@ async function callPatient({ phone, patientName, apptTime, branch, callType }) {
         patient_name: patientName || "Patient",
         appointment_time: toISOish(apptTime),
         branch: branch || "winchester",
-        call_type: callType || "reminder"   // tells the agent which script to use
+        call_type: callType || "reminder"   // "reminder"|"followup"|"birthday"
       }
     },
     { headers: { Authorization: `Bearer ${RETELL_API_KEY}` }, timeout: 10000 }
@@ -288,29 +291,78 @@ const Calendar = {
   },
 };
 
+// -------------------- Birthdays (Google Sheets) ---------
+const BIRTHDAYS_SHEET_ID = process.env.BIRTHDAYS_SHEET_ID;
+
+async function readBirthdays() {
+  if (!BIRTHDAYS_SHEET_ID) return [];
+  const auth = getJWTAuth();
+  const sheets = google.sheets({ version: "v4", auth });
+  const { data } = await sheets.spreadsheets.values.get({
+    spreadsheetId: BIRTHDAYS_SHEET_ID,
+    range: "Sheet1!A:F" // full_name, phone_e164, dob_yyyy_mm_dd, branch, opt_out, last_called_year
+  });
+  const rows = data.values || [];
+  const header = rows.shift() || [];
+  const idx = (name) => header.indexOf(name);
+  const out = [];
+  for (let r = 0; r < rows.length; r++) {
+    const row = rows[r];
+    out.push({
+      _row: r + 2, // 1-based (header is row 1)
+      full_name: row[idx("full_name")] || "",
+      phone_e164: row[idx("phone_e164")] || "",
+      dob: row[idx("dob_yyyy_mm_dd")] || "",
+      branch: (row[idx("branch")] || "winchester").toLowerCase(),
+      opt_out: (row[idx("opt_out")] || "").trim(),
+      last_called_year: (row[idx("last_called_year")] || "").trim(),
+    });
+  }
+  return out;
+}
+
+async function writeLastCalledYear(rowsToUpdate, year) {
+  if (!BIRTHDAYS_SHEET_ID || !rowsToUpdate.length) return;
+  const auth = getJWTAuth();
+  const sheets = google.sheets({ version: "v4", auth });
+  const data = rowsToUpdate.map(r => ({
+    range: `Sheet1!F${r._row}`, // column F = last_called_year
+    values: [[String(year)]],
+  }));
+  await sheets.spreadsheets.values.batchUpdate({
+    spreadsheetId: BIRTHDAYS_SHEET_ID,
+    requestBody: { data, valueInputOption: "RAW" },
+  });
+}
+
 // ------------------------ Retell Action ------------------
 // Global after-hours guard: booking allowed anytime; transfer/route after-hours => message-taking.
 app.post("/retell/action", async (req, res) => {
   try {
-    const event = req.body || {};
+    const event  = req.body || {};
     const action = String(event.action || "").toLowerCase();
     const branch = String(event.branch || "winchester").toLowerCase();
 
+    // Allow a secure testing override of the after-hours guard
+    const tokenOk =
+      !process.env.STATUS_TOKEN ||
+      req.query.token === process.env.STATUS_TOKEN ||
+      req.get("x-status-token") === process.env.STATUS_TOKEN;
+    const forceOpen =
+      tokenOk && (req.query.force_open === "1" || event.force_open === true);
+
     // --- GLOBAL AFTER-HOURS GUARD ---
-    // If it's a request to *speak to someone / route / transfer* and we're closed,
-    // do NOT connect; ask to take a message instead (booking still allowed any time).
     const wantsHuman =
       action.includes("transfer") ||
       action.includes("route") ||
       action.includes("route_human") ||
       action.includes("connect");
 
-    if (wantsHuman && !isOpenNow(branch)) {
+    if (wantsHuman && !isOpenNow(branch) && !forceOpen) {
       const nextOpen = nextOpenString(branch);
       return res.json({
         ok: true,
         response: `Thank you for holding. Our ${branch} office is currently closed. I can take your name, number, and a brief message for the team to return your call ${nextOpen}. Would you like me to do that now?`
-        // No "connect" object => Retell will not attempt a bridge.
       });
     }
 
@@ -349,7 +401,7 @@ app.post("/retell/action", async (req, res) => {
       });
     }
 
-    // HOURS query support (optional): say open/closed and next opening
+    // HOURS query (optional)
     if (action.includes("hours")) {
       const open = isOpenNow(branch);
       if (branch === "portmore") {
@@ -368,9 +420,11 @@ app.post("/retell/action", async (req, res) => {
       });
     }
 
-    // TRANSFER (Retell performs bridge) — only within business hours (global guard already handles closed case)
+    // TRANSFER (Retell performs bridge) — within business hours (global guard handles closed)
     if (action.includes("transfer")) {
       const to = BRANCH_NUMBERS[branch] || BRANCH_NUMBERS.winchester;
+      const open = isOpenNow(branch);
+      console.log(`[Transfer] action=transfer branch=${branch} to=${to} open=${open} at=${new Date().toLocaleString("en-JM",{timeZone:"America/Jamaica"})}`);
       return res.json({
         ok: true,
         response: `One moment please while I connect you to our ${branch} branch.`,
@@ -453,7 +507,8 @@ function summarizeConfig() {
     handoff_timeout_ms: HANDOFF_TIMEOUT_MS,
     google_creds: hasGoogleJson ? "inline JSON" : (hasGoogleB64 ? "base64" : "missing"),
     smtp_host: process.env.SMTP_HOST || null,
-    from_email: FROM_EMAIL
+    from_email: FROM_EMAIL,
+    birthdays_sheet_id: BIRTHDAYS_SHEET_ID ? "set" : "missing"
   };
 }
 
@@ -494,7 +549,7 @@ app.get("/status", async (req, res) => {
   <h3>Checks</h3>
   <table>${row("Google Calendar", `${badge(google.ok)} ${google.note}`)}${row("SMTP", `${badge(smtp.ok)} ${smtp.note}`)}</table>
   <h3>Config</h3>
-  <table>${row("MOH URL", cfg.moh_url)}${row("Handoff Timeout (ms)", cfg.handoff_timeout_ms)}${row("Google Credentials", cfg.google_creds)}${row("SMTP Host", cfg.smtp_host)}${row("From Email", cfg.from_email)}</table>
+  <table>${row("MOH URL", cfg.moh_url)}${row("Handoff Timeout (ms)", cfg.handoff_timeout_ms)}${row("Google Credentials", cfg.google_creds)}${row("SMTP Host", cfg.smtp_host)}${row("From Email", cfg.from_email)}${row("Birthdays Sheet", cfg.birthdays_sheet_id)}</table>
   <h3>Branch Numbers</h3>
   <table>${row("Winchester", cfg.branch_numbers.winchester)}${row("Portmore", cfg.branch_numbers.portmore)}${row("Ardenne", cfg.branch_numbers.ardenne)}${row("Sav", cfg.branch_numbers.sav)}</table>
   </body></html>`);
@@ -583,6 +638,53 @@ app.post("/jobs/run-reminders", async (req, res) => {
     res.json({ ok: true, results });
   } catch (e) {
     console.error("[/jobs/run-reminders]", e.response?.data || e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// --------------- Scheduled Job: birthday calls ---------------
+app.post("/jobs/run-birthdays", async (req, res) => {
+  try {
+    const must = process.env.STATUS_TOKEN;
+    const token = req.query.token || req.get("x-status-token");
+    if (must && token !== must) return res.status(401).json({ ok: false, error: "Unauthorized" });
+
+    if (!shouldCallNow()) {
+      return res.json({ ok: true, note: "Outside calling window; skipped birthdays." });
+    }
+
+    const now = new Date(new Date().toLocaleString("en-US", { timeZone: TZ }));
+    const yyyy = now.getFullYear();
+    const mm = String(now.getMonth() + 1).padStart(2, "0");
+    const dd = String(now.getDate()).padStart(2, "0");
+    const todayMD = `${mm}-${dd}`;
+
+    const rows = await readBirthdays();
+    const toCall = rows.filter(r => {
+      if (r.opt_out) return false;
+      const md = (r.dob || "").slice(5, 10); // MM-DD
+      if (md !== todayMD) return false;
+      if (!r.phone_e164) return false;
+      if (r.last_called_year === String(yyyy)) return false; // already called this year
+      return true;
+    });
+
+    let placed = 0;
+    for (const r of toCall) {
+      await callPatient({
+        phone: r.phone_e164,
+        patientName: r.full_name || "Patient",
+        apptTime: now.toISOString(),      // placeholder
+        branch: r.branch || "winchester",
+        callType: "birthday"              // NEW: birthday script
+      });
+      placed++;
+    }
+
+    if (placed) await writeLastCalledYear(toCall, yyyy);
+    return res.json({ ok: true, scanned: rows.length, birthdays_today: toCall.length, calls_placed: placed });
+  } catch (e) {
+    console.error("[/jobs/run-birthdays]", e.response?.data || e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
