@@ -2,16 +2,13 @@ name: WHC Reminder + Birthday Jobs
 
 on:
   schedule:
-    # 🕒 Appointment reminders (Mon–Fri 8AM–5PM JM)
+    # 🕒 Appointment reminders (Mon–Fri 8:00–17:00 Jamaica = 13–22 UTC)
     - cron: '0,30 13-22 * * 1-5'
-    # 🎂 Birthday calls (daily 9AM JM / 14:00 UTC)
+    # 🎂 Birthday calls (daily 09:00 Jamaica = 14:00 UTC)
     - cron: '0 14 * * *'
   workflow_dispatch:
 
 jobs:
-  # -------------------
-  # Reminder Job
-  # -------------------
   run-reminders:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -21,9 +18,6 @@ jobs:
           curl --fail --show-error --silent -X POST \
             "https://gallant-reverence-production.up.railway.app/jobs/run-reminders?token=${{ secrets.STATUS_TOKEN }}"
 
-  # -------------------
-  # Birthday Job
-  # -------------------
   run-birthdays:
     runs-on: ubuntu-latest
     timeout-minutes: 5
