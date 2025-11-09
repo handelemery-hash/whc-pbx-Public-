@@ -25,6 +25,7 @@ app.use((req, _res, next) => {
 // -------------------------- Config -----------------------
 const HANDOFF_TIMEOUT_MS = Number(process.env.HANDOFF_TIMEOUT_MS || 25000);
 const MOH_URL = process.env.MOH_URL || "https://example.com/moh.mp3";
+const TZ = "America/Jamaica";
 
 const BRANCH_NUMBERS = {
   winchester: process.env.BRANCH_WINCHESTER || "+18769082658",
@@ -41,7 +42,6 @@ const BRANCH_EMAILS = {
 };
 
 const FROM_EMAIL = process.env.FROM_EMAIL || "Winchester Heart Centre <no-reply@whc.local>";
-const TZ = "America/Jamaica";
 
 // Physician calendars
 const PHYSICIANS = {
@@ -68,10 +68,10 @@ function normalizePhys(s) {
   return String(s || "").trim().toLowerCase().replace(/\s+/g, "_");
 }
 function getCalendarIdForPhys(phys) {
-  const k = normalizePhys(phys);
-  const id = PHYSICIANS[k];
+  const key = normalizePhys(phys);
+  const id = PHYSICIANS[key];
   if (!id) throw new Error(`Unknown physician '${phys}'`);
-  return { key: k, id };
+  return { key, id };
 }
 
 // ---------------------- Google Calendar ------------------
@@ -128,12 +128,17 @@ async function sendVoicemailEmail({ branch, caller, recordingUrl, transcript }) 
   await transporter.sendMail({ from: FROM_EMAIL, to, subject: `New Voicemail - ${branch} branch`, html });
 }
 
-// ------------------- Retell Outbound (for reminders) ----
+// ------------------- Retell Outbound (reminders) --------
 const RETELL_API_KEY = process.env.RETELL_API_KEY;
 const RETELL_AGENT_ID = process.env.RETELL_AGENT_ID;
 const RETELL_NUMBER   = process.env.RETELL_NUMBER;
 
-async function callPatient({ phone, patientName, apptTime, branch }) {
+function toISOish(dt) {
+  try { return new Date(dt).toISOString().replace(/\.\d{3}Z$/, "Z"); }
+  catch { return dt; }
+}
+
+async function callPatient({ phone, patientName, apptTime, branch, callType }) {
   if (!RETELL_API_KEY || !RETELL_AGENT_ID || !RETELL_NUMBER) {
     console.warn("[Retell] Missing RETELL_* env vars, skipping outbound call");
     return { skipped: true };
@@ -146,8 +151,9 @@ async function callPatient({ phone, patientName, apptTime, branch }) {
       to_number: phone,
       variables: {
         patient_name: patientName || "Patient",
-        appointment_time: apptTime,
+        appointment_time: toISOish(apptTime),
         branch: branch || "winchester",
+        call_type: callType || "reminder"   // <-- tells the agent which script to use
       }
     },
     { headers: { Authorization: `Bearer ${RETELL_API_KEY}` }, timeout: 10000 }
@@ -195,7 +201,6 @@ const Calendar = {
       description,
       start: { dateTime: start },
       end:   { dateTime: end },
-      // store structured patient details for reminders/follow-ups
       extendedProperties: {
         private: {
           ...(patientName  ? { patient_name:  patientName }  : {}),
@@ -426,7 +431,7 @@ app.post("/jobs/run-reminders", async (req, res) => {
 
     for (const key of physicianKeys) {
       const calendarId = PHYSICIANS[key];
-      const timeMin = new Date(Date.now() - 2*24*3600e3).toISOString(); // look back 2 days (follow-ups)
+      const timeMin = new Date(Date.now() - 2*24*3600e3).toISOString(); // back 2 days (follow-ups)
       const timeMax = new Date(Date.now() + 8*24*3600e3).toISOString(); // ahead 8 days (7/3/1d)
       const { data } = await calendar.events.list({
         calendarId, timeMin, timeMax, singleEvents: true, orderBy: "startTime"
@@ -437,19 +442,26 @@ app.post("/jobs/run-reminders", async (req, res) => {
         const startISO = ev.start?.dateTime || ev.start?.date;
         if (!startISO) continue;
 
-        // read structured patient data
+        // patient data
         const priv = ev.extendedProperties?.private || {};
         const patientName  = priv.patient_name || null;
         const patientPhone = priv.patient_phone || null;
         const branch       = priv.branch || "winchester";
-        if (!patientPhone) continue; // nothing to call
+        if (!patientPhone) continue;
+
+        let changed = false;
 
         // pre-visit reminders
-        let changed = false;
         for (const win of dueWindowsFor(startISO)) {
           const flag = `reminded_${win}`;
           if (!priv[flag]) {
-            await callPatient({ phone: patientPhone, patientName, apptTime: startISO, branch });
+            await callPatient({
+              phone: patientPhone,
+              patientName,
+              apptTime: startISO,
+              branch,
+              callType: "reminder" // <-- tag
+            });
             priv[flag] = "true";
             actions++; changed = true;
           }
@@ -459,7 +471,13 @@ app.post("/jobs/run-reminders", async (req, res) => {
         const endISO = ev.end?.dateTime || ev.end?.date || startISO;
         const minsSinceEnd = -minutesUntil(endISO); // positive after end
         if (minsSinceEnd >= (24*60 - 15) && minsSinceEnd <= (24*60 + 15) && !priv.followup_1d) {
-          await callPatient({ phone: patientPhone, patientName, apptTime: startISO, branch });
+          await callPatient({
+            phone: patientPhone,
+            patientName,
+            apptTime: startISO,
+            branch,
+            callType: "followup" // <-- tag
+          });
           priv.followup_1d = "true";
           actions++; changed = true;
         }
