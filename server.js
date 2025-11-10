@@ -80,10 +80,8 @@ const PROCEDURE_CALENDARS = {
 };
 
 // ---------------------- Hours & After-Hours Guard ----------------------
-// Portmore: Mon–Fri 10:00–17:00, Sat 10:00–14:00 ; others: Mon–Fri 08:30–16:30 ; Closed Sundays & public holidays
 function isSunday(d) { return d.getUTCDay ? d.getUTCDay() === 0 : new Date(d).getUTCDay() === 0; }
-// NOTE: Jamaica is America/Jamaica (UTC-5, no DST). For simplicity, we approximate with local server time.
-// For precise TZ handling, integrate luxon/timezone; this heuristic is fine for routing decisions.
+// NOTE: Jamaica is America/Jamaica (UTC-5, no DST). For precise TZ use a timezone lib.
 const HOURS = {
   winchester: { monfri: { start: 8.5, end: 16.5 }, sat: null },
   ardenne:    { monfri: { start: 8.5, end: 16.5 }, sat: null },
@@ -209,6 +207,17 @@ const Calendar = {
     return { key, id, items: data.items || [] };
   },
 
+  async upcomingByCalendarId(calendarId, max = 50) {
+    const auth = getJWTAuth();
+    const calendar = google.calendar({ version:"v3", auth });
+    const { data } = await calendar.events.list({
+      calendarId, timeMin: new Date().toISOString(),
+      maxResults: Math.min(Math.max(+max || 50, 1), 50),
+      singleEvents:true, orderBy:"startTime"
+    });
+    return data.items || [];
+  },
+
   async deleteEvent(physician, eventId) {
     const { id } = getCalendarIdForPhys(physician);
     const auth = getJWTAuth();
@@ -302,7 +311,6 @@ app.post("/calendar/delete", async (req, res) => {
 const RETELL_API_KEY = process.env.RETELL_API_KEY || "";
 const RETELL_AGENT_ID = process.env.RETELL_AGENT_ID || "";
 
-// Outbound call helper (Retell)
 async function retellCall({ to, from, variables = {}, call_type = "reminder" }) {
   if (!RETELL_API_KEY || !RETELL_AGENT_ID) {
     console.warn("[Retell] Missing RETELL_API_KEY / RETELL_AGENT_ID; skipping call");
@@ -331,7 +339,6 @@ app.post("/retell/action", async (req, res) => {
     const event = req.body || {};
     const action = String(event.action || "").toLowerCase();
 
-    // Book (procedure or consult)
     if (action.includes("book")) {
       const r = await Calendar.createEvent({
         physician: event.physician,
@@ -349,7 +356,6 @@ app.post("/retell/action", async (req, res) => {
       });
     }
 
-    // Next appointment for physician
     if (action.includes("next")) {
       const u = await Calendar.upcoming(event.physician, 1);
       if (!u.items.length) return res.json({ ok:true, response:"No upcoming events." });
@@ -361,7 +367,6 @@ app.post("/retell/action", async (req, res) => {
       });
     }
 
-    // Connect test (outbound)
     if (action.includes("connect")) {
       const result = await retellCall({
         to: event.to, from: event.from, call_type: "connect_test",
@@ -429,7 +434,6 @@ app.post("/telnyx/inbound", async (req, res) => {
           recordingUrl: "(no recording)",
           transcript: null,
         });
-        // Optional: say line closed message (requires TTS; omitted here)
         return res.json({ ok:true, note:"after-hours, message taken" });
       }
 
@@ -474,10 +478,18 @@ async function getSheets() {
   return google.sheets({ version: "v4", auth });
 }
 
-// Parse "Phone: +1876..." line from event description
+// Parse helpers from event description
 function extractPhoneFromDescription(desc="") {
   const m = desc.match(/Phone:\s*([+\d][\d\s\-()]+)/i);
   return m ? m[1].replace(/[^\d+]/g,"") : null;
+}
+function extractBranchFromDescription(desc="") {
+  const m = desc.match(/Branch:\s*(\w+)/i);
+  return m ? m[1].toLowerCase() : "winchester";
+}
+function extractServiceFromDescription(desc="") {
+  const m = desc.match(/Service:\s*([^\n]+)/i);
+  return m ? m[1].trim() : null;
 }
 
 // Secure middleware for jobs/status
@@ -488,10 +500,13 @@ function requireStatusToken(req, res, next){
 }
 
 // Reminders (7/3/1 days before) + Follow-ups (1 day after)
+// — now runs for BOTH physician calendars AND procedure calendars.
 app.post("/jobs/run-reminders", requireStatusToken, async (req, res) => {
   try {
     const today = new Date();
     const results = [];
+
+    // 1) Physician calendars (existing behavior)
     for (const physKey of Object.keys(PHYSICIANS)) {
       const { items } = await Calendar.upcoming(physKey, 50);
       for (const ev of items) {
@@ -501,35 +516,69 @@ app.post("/jobs/run-reminders", requireStatusToken, async (req, res) => {
         const daysDiff = Math.round((start - today) / (1000*60*60*24));
         const desc = ev.description || "";
         const phone = extractPhoneFromDescription(desc);
-        const branchMatch = desc.match(/Branch:\s*(\w+)/i);
-        const branch = branchMatch ? branchMatch[1].toLowerCase() : "winchester";
+        const branch = extractBranchFromDescription(desc);
 
-        // Reminders 7/3/1 days
         if ([7,3,1].includes(daysDiff) && phone) {
-          const payload = {
-            to: phone,
+          const r = await retellCall({
+            to: phone, call_type:"reminder",
             variables: {
-              call_type: "reminder",
               appointment_time: start.toISOString(),
               branch,
               physician: PHYSICIAN_DISPLAY[physKey] || physKey
             }
-          };
-          const r = await retellCall({ to: phone, call_type:"reminder", variables: payload.variables });
-          results.push({ eventId: ev.id, phone, daysDiff, ok: r.ok });
+          });
+          results.push({ type:"physician", eventId: ev.id, phone, daysDiff, ok: r.ok });
         }
 
-        // Follow-up (1 day after)
         const daysAfter = Math.round((today - start) / (1000*60*60*24));
         if (daysAfter === 1 && phone) {
           const r = await retellCall({
             to: phone, call_type:"followup",
             variables: { branch, physician: PHYSICIAN_DISPLAY[physKey] || physKey }
           });
-          results.push({ eventId: ev.id, phone, followup:true, ok: r.ok });
+          results.push({ type:"physician", eventId: ev.id, phone, followup:true, ok: r.ok });
         }
       }
     }
+
+    // 2) Procedure calendars (new)
+    for (const [branchKey, calId] of Object.entries(PROCEDURE_CALENDARS)) {
+      if (!calId) continue;
+      const items = await Calendar.upcomingByCalendarId(calId, 50);
+      for (const ev of items) {
+        const startIso = ev.start?.dateTime || ev.start?.date;
+        if (!startIso) continue;
+        const start = new Date(startIso);
+        const daysDiff = Math.round((start - today) / (1000*60*60*24));
+        const desc = ev.description || "";
+        const phone = extractPhoneFromDescription(desc);
+        // Prefer explicit Branch in description; else infer from calendar we’re scanning
+        const branch = extractBranchFromDescription(desc) || branchKey;
+        const service = extractServiceFromDescription(desc) || ev.summary || "Procedure";
+
+        if ([7,3,1].includes(daysDiff) && phone) {
+          const r = await retellCall({
+            to: phone, call_type:"reminder",
+            variables: {
+              appointment_time: start.toISOString(),
+              branch,
+              service
+            }
+          });
+          results.push({ type:"procedure", eventId: ev.id, phone, daysDiff, service, ok: r.ok });
+        }
+
+        const daysAfter = Math.round((today - start) / (1000*60*60*24));
+        if (daysAfter === 1 && phone) {
+          const r = await retellCall({
+            to: phone, call_type:"followup",
+            variables: { branch, service }
+          });
+          results.push({ type:"procedure", eventId: ev.id, phone, followup:true, service, ok: r.ok });
+        }
+      }
+    }
+
     res.json({ ok:true, results });
   } catch (err) {
     console.error("[/jobs/run-reminders] error:", err?.response?.data || err.message);
@@ -586,7 +635,8 @@ app.post("/jobs/run-birthdays", requireStatusToken, async (req, res) => {
 
       // Write back last_called_year
       if (iLastYear >= 0 && rCall.ok) {
-        const rangeWrite = `Sheet1!${String.fromCharCode(65 + iLastYear)}${r+1}`;
+        const col = String.fromCharCode(65 + iLastYear); // naive A..Z
+        const rangeWrite = `Sheet1!${col}${r+1}`;
         await sheets.spreadsheets.values.update({
           spreadsheetId: SHEET_ID, range: rangeWrite, valueInputOption:"RAW",
           requestBody: { values: [[ String(currentYear) ]] }
@@ -604,12 +654,11 @@ app.post("/jobs/run-birthdays", requireStatusToken, async (req, res) => {
 // ------------------------ Diagnostics --------------------
 app.get("/status.json", requireStatusToken, async (req, res) => {
   try {
-    // quick checks
     const checks = {
       smtp: !!(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS),
       google_creds: !!(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON || process.env.GOOGLE_CREDENTIALS_B64),
       telnyx: !!TELNYX_API_KEY,
-      retell: !!(RETELL_API_KEY && RETELL_AGENT_ID),
+      retell: !!(process.env.RETELL_API_KEY && process.env.RETELL_AGENT_ID),
       proc_cals: Object.values(PROCEDURE_CALENDARS).every(Boolean),
     };
     res.json({
