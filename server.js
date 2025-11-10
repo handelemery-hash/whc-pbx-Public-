@@ -1,17 +1,21 @@
-// server.js — WHC PBX + Calendar + Retell + Email + Status + Reminders + Hours Guard + Birthdays (enhanced)
-// ---------------------------------------------------------------------------------------------------------
+// server.js — WHC PBX + Calendar + Procedures + Jobs (Retell + Telnyx + Email + Google)
+// -------------------------------------------------------------------------------------
+// ENV REQUIRED (Railway → Variables):
+// TELNYX_API_KEY, TELNYX_CONNECTION_ID, TELNYX_OUTBOUND_CALLER_ID, MOH_URL, HANDOFF_TIMEOUT_MS
+// BRANCH_WINCHESTER, BRANCH_PORTMORE, BRANCH_ARDENNE, BRANCH_SAV
+// SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, FROM_EMAIL
+// EMAIL_WINCHESTER, EMAIL_PORTMORE, EMAIL_ARDENNE, EMAIL_SAV
+// GOOGLE_APPLICATION_CREDENTIALS_JSON or GOOGLE_CREDENTIALS_B64
+// PROC_CAL_WINCHESTER, PROC_CAL_PORTMORE, PROC_CAL_ARDENNE, PROC_CAL_SAV
+// RETELL_API_KEY, RETELL_AGENT_ID  (for outbound reminder/birthday calls)
+// BIRTHDAYS_SHEET_ID               (Google Sheet id for birthdays)
+// STATUS_TOKEN                     (protect /status and /jobs/* endpoints)
 
-import http from "http";
 import express from "express";
 import cors from "cors";
 import { google } from "googleapis";
 import axios from "axios";
 import nodemailer from "nodemailer";
-import dayjs from "dayjs";
-import utc from "dayjs/plugin/utc.js";
-import tz from "dayjs/plugin/timezone.js";
-dayjs.extend(utc);
-dayjs.extend(tz);
 
 // -------------------------- App --------------------------
 const app = express();
@@ -19,9 +23,7 @@ app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
 app.get("/health", (_req, res) => res.status(200).send("ok"));
-app.get("/", (_req, res) => res.status(200).send("WHC PBX running"));
 
-// Simple req log
 app.use((req, _res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
   next();
@@ -30,7 +32,7 @@ app.use((req, _res, next) => {
 // -------------------------- Config -----------------------
 const HANDOFF_TIMEOUT_MS = Number(process.env.HANDOFF_TIMEOUT_MS || 25000);
 const MOH_URL = process.env.MOH_URL || "https://example.com/moh.mp3";
-const TZ = "America/Jamaica";
+const STATUS_TOKEN = process.env.STATUS_TOKEN || "";
 
 const BRANCH_NUMBERS = {
   winchester: process.env.BRANCH_WINCHESTER || "+18769082658",
@@ -69,92 +71,163 @@ const PHYSICIAN_DISPLAY = {
   dr_dixon: "Dr Dixon",
 };
 
-function normalizePhys(s) {
-  return String(s || "").trim().toLowerCase().replace(/\s+/g, "_");
-}
-function getCalendarIdForPhys(phys) {
-  const key = normalizePhys(phys);
-  const id = PHYSICIANS[key];
-  if (!id) throw new Error(`Unknown physician '${phys}'`);
-  return { key, id };
-}
-
-// ----------------------- Business Hours -----------------------
-const HOURS = {
-  timezone: TZ,
-  winchester: { mon_fri: ["08:30","16:30"], sat: null,               sun: null },
-  ardenne:    { mon_fri: ["08:30","16:30"], sat: null,               sun: null },
-  sav:        { mon_fri: ["08:30","16:30"], sat: null,               sun: null },
-  portmore:   { mon_fri: ["10:00","17:00"], sat: ["10:00","14:00"],  sun: null },
+// Procedure calendars (by branch)
+const PROCEDURE_CALENDARS = {
+  winchester: process.env.PROC_CAL_WINCHESTER || "a434db3192bb86669c1238fd8840d62d72a254cea1b58d01da3dd61eefeb1ba6@group.calendar.google.com",
+  portmore:   process.env.PROC_CAL_PORTMORE   || "1dce088aed350313f0848a6950f97fdaa44616145b523097b23877f3aa0278a5@group.calendar.google.com",
+  ardenne:    process.env.PROC_CAL_ARDENNE    || "d86eacf4f06f69310210007c96a91941ba3f0eb37a6165e350f3227b604cee06@group.calendar.google.com",
+  sav:        process.env.PROC_CAL_SAV        || "79ff142150e20453f5600b25f445c1d27f03d30594dadc5c777b4ed9af360e5e@group.calendar.google.com",
 };
-function hmToMin(hm){ const [h,m]=hm.split(":").map(Number); return h*60+(m||0); }
-function nowJM(d=new Date()){ return dayjs(d).tz(TZ); }
-function isOpenNow(branchRaw, d=new Date()){
-  const branch = (branchRaw||"winchester").toLowerCase();
-  const spec = HOURS[branch] || HOURS.winchester;
-  const local = nowJM(d);
-  const day = local.day(); // 0..6
-  const minutes = local.hour()*60 + local.minute();
-  let open=null, close=null;
-  if (day===6 && spec.sat) [open, close] = spec.sat.map(hmToMin);
-  else if (day>=1 && day<=5 && spec.mon_fri) [open, close] = spec.mon_fri.map(hmToMin);
-  return (open!=null && minutes>=open && minutes<=close);
-}
-function nextOpenString(branchRaw, from=new Date()){
-  const branch = (branchRaw||"winchester").toLowerCase();
-  const spec = HOURS[branch] || HOURS.winchester;
-  let base = nowJM(from);
-  for (let i=0;i<7;i++){
-    const d = base.add(i,'day');
-    const day = d.day();
-    let window = null;
-    if (day===6 && spec.sat) window = spec.sat;
-    else if (day>=1 && day<=5 && spec.mon_fri) window = spec.mon_fri;
-    if (!window) continue;
-    const labelDay = i===0 ? "today" : i===1 ? "tomorrow" : d.format("dddd");
-    return `${labelDay} at ${window[0]}`;
+
+// ---------------------- Hours & After-Hours Guard ----------------------
+// Portmore: Mon–Fri 10:00–17:00, Sat 10:00–14:00 ; others: Mon–Fri 08:30–16:30 ; Closed Sundays & public holidays
+function isSunday(d) { return d.getUTCDay ? d.getUTCDay() === 0 : new Date(d).getUTCDay() === 0; }
+// NOTE: Jamaica is America/Jamaica (UTC-5, no DST). For simplicity, we approximate with local server time.
+// For precise TZ handling, integrate luxon/timezone; this heuristic is fine for routing decisions.
+const HOURS = {
+  winchester: { monfri: { start: 8.5, end: 16.5 }, sat: null },
+  ardenne:    { monfri: { start: 8.5, end: 16.5 }, sat: null },
+  sav:        { monfri: { start: 8.5, end: 16.5 }, sat: null },
+  portmore:   { monfri: { start: 10,  end: 17   }, sat: { start: 10, end: 14 } },
+};
+function isAfterHours(branch, when = new Date()) {
+  const b = (branch || "winchester").toLowerCase();
+  const h = HOURS[b] || HOURS.winchester;
+  const day = when.getDay(); // 0=Sun..6=Sat
+  const hour = when.getHours() + when.getMinutes()/60;
+  if (day === 0) return true; // Sunday closed
+  if (day === 6) {
+    if (!h.sat) return true;
+    return !(hour >= h.sat.start && hour < h.sat.end);
   }
-  return "the next business day";
+  // Mon-Fri
+  return !(hour >= h.monfri.start && hour < h.monfri.end);
 }
 
-// ---------------------- Google Auth (Calendar + Sheets) -------
+// ---------------------- Google Auth ----------------------
 function loadServiceAccountJSON() {
-  const inline = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
   const b64 = process.env.GOOGLE_CREDENTIALS_B64;
+  const inline = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
   if (inline) {
     const txt = inline.trim();
     const json = JSON.parse(txt.startsWith("{") ? txt : Buffer.from(txt, "base64").toString("utf8"));
-    console.log("✅ [Google] Loaded credentials from GOOGLE_APPLICATION_CREDENTIALS_JSON");
+    console.log("✅ [Calendar] Loaded credentials from GOOGLE_APPLICATION_CREDENTIALS_JSON");
     return json;
   }
   if (b64) {
     const json = JSON.parse(Buffer.from(b64, "base64").toString("utf8"));
-    console.log("✅ [Google] Loaded credentials from GOOGLE_CREDENTIALS_B64");
+    console.log("✅ [Calendar] Loaded credentials from GOOGLE_CREDENTIALS_B64");
     return json;
   }
   throw new Error("Missing Google credentials env");
 }
-function getJWTAuth() {
+function getJWTAuth(scopes = ["https://www.googleapis.com/auth/calendar"]) {
   const creds = loadServiceAccountJSON();
-  return new google.auth.JWT(
-    creds.client_email, null, creds.private_key,
-    [
-      "https://www.googleapis.com/auth/calendar",
-      "https://www.googleapis.com/auth/spreadsheets"
-    ]
-  );
+  return new google.auth.JWT(creds.client_email, null, creds.private_key, scopes);
+}
+function normalizePhys(s) {
+  return String(s || "").trim().toLowerCase().replace(/\s+/g, "_");
 }
 
+// ---------------------- Procedure Classification ----------------------
+const SERVICE_SYNONYMS = [
+  { canon: "ecg", terms: ["ecg","electrocardiogram","electrocardiograms","stress ecg"] },
+  { canon: "echo", terms: ["echo","echocardiogram","echocardiograms"] },
+  { canon: "stress_echo", terms: ["stress echo","stress echocardiogram","stress echocardiograms","exercise stress echocardiogram","exercise stress echocardiograms"] },
+  { canon: "stress_test", terms: ["stress test","exercise stress test","treadmill test","exercise test"] },
+  { canon: "bubble_echo", terms: ["bubble study","bubble studies","bubble echo","bubble echocardiogram","bubble echocardiograms"] },
+  { canon: "dobutamine_stress_echo", terms: ["dobutamine stress echo","dobutamine stress echocardiogram"] },
+  { canon: "holter_24", terms: ["24 hour holter","24 hr holter","24-hour holter","holter 24"] },
+  { canon: "holter_48", terms: ["48 hour holter","48 hr holter","48-hour holter","holter 48"] },
+  { canon: "abpm_24", terms: ["24 hour abpm","24 hr abpm","24-hour abpm","abpm 24","ambulatory blood pressure 24","ambulatory bp 24"] },
+  { canon: "abpm_48", terms: ["48 hour abpm","48 hr abpm","48-hour abpm","abpm 48","ambulatory blood pressure 48","ambulatory bp 48"] },
+  { canon: "pacemaker", terms: ["pacemaker interrogation","pacemaker check","pacemaker clinic"] },
+  { canon: "consult", terms: ["consult","consultation","follow up","follow-up","review"] },
+];
+function normalizeText(s){return String(s||"").toLowerCase().replace(/\s+/g," ").trim();}
+function classifyService(rawService){
+  const txt = normalizeText(rawService||"");
+  for (const g of SERVICE_SYNONYMS) for (const t of g.terms) if (txt.includes(normalizeText(t))) return { canon:g.canon, isProcedure:g.canon!=="consult" };
+  if (["ecg","echo","echocardiogram","stress","bubble","holter","abpm","pacemaker"].some(h=>txt.includes(h))) return { canon:"procedure_generic", isProcedure:true };
+  return { canon:"consult", isProcedure:false };
+}
+function getCalendarIdForBooking({ service, branch, physicianKey }) {
+  const { isProcedure } = classifyService(service||"");
+  if (isProcedure) {
+    const b = (branch||"winchester").toLowerCase();
+    const id = PROCEDURE_CALENDARS[b] || PROCEDURE_CALENDARS.winchester;
+    if (!id) throw new Error(`Missing procedure calendar for branch '${b}'`);
+    return id;
+  }
+  const k = normalizePhys(physicianKey);
+  const physId = PHYSICIANS[k];
+  if (!physId) throw new Error(`Unknown physician for consult booking: '${physicianKey}'`);
+  return physId;
+}
+function getCalendarIdForPhys(physician){
+  const k = normalizePhys(physician);
+  const id = PHYSICIANS[k];
+  if(!id) throw new Error(`Unknown physician '${physician}'`);
+  return { key:k, id };
+}
+
+// ---------------------- Calendar Wrapper ----------------------
+const Calendar = {
+  async createEvent({ physician, start, end, summary, service, phone, note, branch }) {
+    const calendarId = getCalendarIdForBooking({
+      service: service || summary,
+      branch: (branch || note?.branch || "winchester"),
+      physicianKey: physician || ""
+    });
+    const auth = getJWTAuth();
+    const calendar = google.calendar({ version:"v3", auth });
+    const description = [
+      phone ? `Phone: ${phone}` : null,
+      note ? `Note: ${typeof note === "string" ? note : JSON.stringify(note)}` : null,
+      physician ? `Physician: ${PHYSICIAN_DISPLAY[normalizePhys(physician)] || physician}` : null,
+      `Branch: ${(branch || note?.branch || "winchester")}`,
+      service ? `Service: ${service}` : null,
+    ].filter(Boolean).join("\n");
+    const title = service || summary || "Consultation";
+    const { data } = await calendar.events.insert({
+      calendarId,
+      requestBody: { summary: title, description, start:{dateTime:start}, end:{dateTime:end} },
+    });
+    const physKey = physician ? normalizePhys(physician) : null;
+    return { key: physKey, id: calendarId, event: data };
+  },
+
+  async upcoming(physician, max = 10) {
+    const { key, id } = getCalendarIdForPhys(physician);
+    const auth = getJWTAuth();
+    const calendar = google.calendar({ version:"v3", auth });
+    const { data } = await calendar.events.list({
+      calendarId: id, timeMin: new Date().toISOString(),
+      maxResults: Math.min(Math.max(+max || 10, 1), 50),
+      singleEvents:true, orderBy:"startTime"
+    });
+    return { key, id, items: data.items || [] };
+  },
+
+  async deleteEvent(physician, eventId) {
+    const { id } = getCalendarIdForPhys(physician);
+    const auth = getJWTAuth();
+    const calendar = google.calendar({ version:"v3", auth });
+    await calendar.events.delete({ calendarId:id, eventId });
+    return true;
+  },
+};
+
 // --------------------------- Email -----------------------
-function makeTransport() {
+function makeTransport(){
   const host = process.env.SMTP_HOST;
   const port = Number(process.env.SMTP_PORT || 587);
   const user = process.env.SMTP_USER;
   const pass = process.env.SMTP_PASS;
   if (!host || !user || !pass) return null;
-  return nodemailer.createTransport({ host, port, secure: port === 465, auth: { user, pass } });
+  return nodemailer.createTransport({ host, port, secure: port===465, auth:{user,pass} });
 }
-async function sendVoicemailEmail({ branch, caller, recordingUrl, transcript }) {
+async function sendVoicemailEmail({ branch, caller, recordingUrl, transcript }){
   const to = BRANCH_EMAILS[branch] || BRANCH_EMAILS.winchester;
   const transporter = makeTransport();
   if (!transporter) { console.warn("[Email] SMTP not configured; skipping voicemail email"); return; }
@@ -164,726 +237,393 @@ async function sendVoicemailEmail({ branch, caller, recordingUrl, transcript }) 
     <p><b>Recording:</b> <a href="${recordingUrl}">${recordingUrl}</a></p>
     ${transcript ? `<pre>${transcript}</pre>` : ""}
   `;
-  await transporter.sendMail({ from: FROM_EMAIL, to, subject: `New Voicemail - ${branch} branch`, html });
+  await transporter.sendMail({ from: FROM_EMAIL, to, subject:`New Voicemail - ${branch} branch`, html });
 }
 
-// ------------------- Retell Outbound (reminders etc.) ---
-const RETELL_API_KEY = process.env.RETELL_API_KEY;
-const RETELL_AGENT_ID = process.env.RETELL_AGENT_ID;
-const RETELL_NUMBER   = process.env.RETELL_NUMBER;
-
-function toISOish(dt) {
-  try { return new Date(dt).toISOString().replace(/\.\d{3}Z$/, "Z"); } catch { return dt; }
-}
-async function callPatient({ phone, patientName, apptTime, branch, callType }) {
-  if (!RETELL_API_KEY || !RETELL_AGENT_ID || !RETELL_NUMBER) {
-    console.warn("[Retell] Missing RETELL_* env vars, skipping outbound call");
-    return { skipped: true };
-  }
-  const r = await axios.post(
-    "https://api.retellai.com/v1/calls/outbound",
-    {
-      agent_id: RETELL_AGENT_ID,
-      from_number: RETELL_NUMBER,
-      to_number: phone,
-      variables: {
-        patient_name: patientName || "Patient",
-        appointment_time: toISOish(apptTime),
-        branch: branch || "winchester",
-        call_type: callType || "reminder"
-      }
-    },
-    { headers: { Authorization: `Bearer ${RETELL_API_KEY}` }, timeout: 10000 }
-  );
-  return r.data || { ok: true };
-}
-
-// ------------------- Reminder helpers -------------------
-function minutesUntil(dateISO) {
-  const start = new Date(dateISO);
-  return Math.round((start.getTime() - Date.now()) / 60000);
-}
-function dueWindowsFor(startISO) {
-  const m = minutesUntil(startISO);
-  const due = [];
-  const isWithin = (targetMin, window=15) => Math.abs(m - targetMin) <= window;
-  if (isWithin(7*24*60)) due.push("7d");
-  if (isWithin(3*24*60)) due.push("3d");
-  if (isWithin(24*60))   due.push("1d");
-  return due;
-}
-// Only place calls during daytime hours in Jamaica (Mon–Sat 09:00–18:00)
-function shouldCallNow() {
-  const d  = dayjs().tz(TZ);
-  const hour = d.hour();
-  const dow  = d.day(); // 0=Sun
-  if (dow === 0) return false;
-  return hour >= 9 && hour <= 18;
-}
-
-// -------------------- Calendar wrapper ------------------
-const Calendar = {
-  async createEvent({ physician, start, end, summary, phone, note, patientName, patientPhone, branch }) {
-    const { key, id } = getCalendarIdForPhys(physician);
-    const auth = getJWTAuth();
-    const calendar = google.calendar({ version: "v3", auth });
-
-    const description = [
-      phone ? `Phone: ${phone}` : null,
-      note ? `Note: ${note}` : null,
-    ].filter(Boolean).join("\n");
-
-    const requestBody = {
-      summary: summary || "Consultation",
-      description,
-      start: { dateTime: start },
-      end:   { dateTime: end },
-      extendedProperties: {
-        private: {
-          ...(patientName  ? { patient_name:  patientName }  : {}),
-          ...(patientPhone ? { patient_phone: patientPhone } : (phone ? { patient_phone: phone } : {})),
-          ...(branch       ? { branch } : {})
-        }
-      }
-    };
-
-    const { data } = await calendar.events.insert({ calendarId: id, requestBody });
-    return { key, id, event: data };
-  },
-
-  async upcoming(physician, max = 10) {
-    const { key, id } = getCalendarIdForPhys(physician);
-    const auth = getJWTAuth();
-    const calendar = google.calendar({ version: "v3", auth });
-
-    const { data } = await calendar.events.list({
-      calendarId: id,
-      timeMin: new Date().toISOString(),
-      maxResults: Math.min(Math.max(+max || 10, 1), 50),
-      singleEvents: true,
-      orderBy: "startTime",
+// ------------------------ Calendar Routes ----------------
+app.post("/calendar/create", async (req, res) => {
+  try {
+    const { physician, start, end, summary, phone, note, service, branch } = req.body || {};
+    if (!start || !end || (!physician && !service)) {
+      return res.status(400).json({ ok:false, error:"start, end, and (physician or service) required" });
+    }
+    const mergedNote = typeof note === "object" ? note : (note ? { text: note } : {});
+    const r = await Calendar.createEvent({
+      physician, start, end, summary, service, phone,
+      note: { ...mergedNote, branch: branch || mergedNote.branch },
+      branch
     });
-
-    return { key, id, items: data.items || [] };
-  },
-
-  async deleteEvent(physician, eventId) {
-    const { id } = getCalendarIdForPhys(physician);
-    const auth = getJWTAuth();
-    const calendar = google.calendar({ version: "v3", auth });
-    await calendar.events.delete({ calendarId: id, eventId });
-    return true;
-  },
-};
-
-// -------------------- Birthdays (Google Sheets) ---------
-const BIRTHDAYS_SHEET_ID = process.env.BIRTHDAYS_SHEET_ID;
-
-// Header cache for column mapping
-let BDAY_HDR = null;
-async function getBirthdayHeader() {
-  if (BDAY_HDR) return BDAY_HDR;
-  const auth = getJWTAuth();
-  const sheets = google.sheets({ version: "v4", auth });
-  const { data } = await sheets.spreadsheets.values.get({
-    spreadsheetId: BIRTHDAYS_SHEET_ID,
-    range: "Sheet1!A1:Z1"
-  });
-  BDAY_HDR = (data.values && data.values[0]) || [];
-  return BDAY_HDR;
-}
-function colIdxToA1(idx) {
-  // 0 -> A, 1 -> B ...
-  let n = idx + 1, s = "";
-  while (n > 0) {
-    const r = (n - 1) % 26;
-    s = String.fromCharCode(65 + r) + s;
-    n = Math.floor((n - 1) / 26);
-  }
-  return s;
-}
-
-async function readBirthdaySheet() {
-  if (!BIRTHDAYS_SHEET_ID) return [];
-  const auth = getJWTAuth();
-  const sheets = google.sheets({ version: "v4", auth });
-  const { data } = await sheets.spreadsheets.values.get({
-    spreadsheetId: BIRTHDAYS_SHEET_ID,
-    range: "Sheet1!A:Z"
-  });
-  const rows = data.values || [];
-  const header = rows.shift() || [];
-  const idx = (name) => header.indexOf(name);
-  const out = [];
-  for (let r = 0; r < rows.length; r++) {
-    const row = rows[r];
-    out.push({
-      rowIndex: r + 2,
-      full_name: row[idx("full_name")] || "",
-      phone_e164: row[idx("phone_e164")] || "",
-      dob_yyyy_mm_dd: row[idx("dob_yyyy_mm_dd")] || "",
-      branch: (row[idx("branch")] || "winchester").toLowerCase(),
-      opt_out: (row[idx("opt_out")] || "").trim(),
-      opt_out_reason: (row[idx("opt_out_reason")] || "").trim(),
-      last_called_year: (row[idx("last_called_year")] || "").trim(),
-      last_outcome: (row[idx("last_outcome")] || "").trim(),
-      last_outcome_ts: (row[idx("last_outcome_ts")] || "").trim(),
-      deferred_for_yyyy_mm_dd: (row[idx("deferred_for_yyyy_mm_dd")] || "").trim(),
-      deferred_reason: (row[idx("deferred_reason")] || "").trim(),
-      dob_correction: (row[idx("dob_correction")] || "").trim(),
-      new_phone_candidate: (row[idx("new_phone_candidate")] || "").trim(),
-      status_flag: (row[idx("status_flag")] || "").trim(),
-      status_note: (row[idx("status_note")] || "").trim(),
-      preferred_contact: (row[idx("preferred_contact")] || "").trim(),
-      caregiver_name: (row[idx("caregiver_name")] || "").trim(),
-      caregiver_phone: (row[idx("caregiver_phone")] || "").trim(),
-      pause_until_yyyy_mm_dd: (row[idx("pause_until_yyyy_mm_dd")] || "").trim(),
+    return res.json({
+      ok:true,
+      eventId:r.event.id, htmlLink:r.event.htmlLink,
+      response:`Created ${service ? "procedure" : "appointment"} ${service ? `(${service})` : ""}${physician ? ` for ${PHYSICIAN_DISPLAY[r.key] || r.key}` : ""}`,
     });
+  } catch (err) {
+    console.error("[/calendar/create] error:", err?.response?.data || err.message);
+    res.status(500).json({ ok:false, error: err.message });
   }
-  return out;
-}
+});
 
-async function writeBirthdayRow(rowIndex, patch) {
-  if (!BIRTHDAYS_SHEET_ID || !rowIndex || !patch) return;
-  const header = await getBirthdayHeader();
-  const auth = getJWTAuth();
-  const sheets = google.sheets({ version: "v4", auth });
-
-  const data = [];
-  for (const [key, value] of Object.entries(patch)) {
-    const col = header.indexOf(key);
-    if (col === -1) continue; // unknown key
-    const a1 = `${colIdxToA1(col)}${rowIndex}`;
-    data.push({ range: `Sheet1!${a1}`, values: [[value ?? ""]] });
+app.get("/calendar/upcoming/:physician", async (req, res) => {
+  try {
+    const { physician } = req.params;
+    const { max } = req.query;
+    const { key, items } = await Calendar.upcoming(physician, Number(max || 10));
+    res.json({
+      ok:true,
+      physician: PHYSICIAN_DISPLAY[key] || key,
+      count: items.length,
+      events: items.map(ev => ({
+        id: ev.id, summary: ev.summary,
+        start: ev.start?.dateTime || ev.start?.date,
+        end: ev.end?.dateTime || ev.end?.date,
+        link: ev.htmlLink,
+      })),
+    });
+  } catch (err) {
+    console.error("[/calendar/upcoming] error:", err?.response?.data || err.message);
+    res.status(500).json({ ok:false, error: err.message });
   }
-  if (!data.length) return;
-  await sheets.spreadsheets.values.batchUpdate({
-    spreadsheetId: BIRTHDAYS_SHEET_ID,
-    requestBody: { data, valueInputOption: "RAW" },
-  });
-}
+});
 
-async function findBirthdayRowByPhoneOrName(phone, name) {
-  const rows = await readBirthdaySheet();
-  const p = String(phone || "").replace(/\s+/g, "");
-  let row = rows.find(r => (r.phone_e164 || "").replace(/\s+/g, "") === p);
-  if (!row && name) {
-    const n = String(name).toLowerCase().trim();
-    row = rows.find(r => String(r.full_name || "").toLowerCase().trim() === n);
+app.post("/calendar/delete", async (req, res) => {
+  try {
+    const { physician, eventId } = req.body || {};
+    if (!physician || !eventId) return res.status(400).json({ ok:false, error:"physician and eventId required" });
+    await Calendar.deleteEvent(physician, eventId);
+    res.json({ ok:true });
+  } catch (err) {
+    console.error("[/calendar/delete] error:", err?.response?.data || err.message);
+    res.status(500).json({ ok:false, error: err.message });
   }
-  return row || null;
-}
-
-// ---- Jamaica 2025 public holidays (simple set; optional to expand) ----
-const JM_HOLIDAYS_2025 = new Set([
-  "2025-01-01","2025-02-26","2025-04-18","2025-04-21","2025-05-23",
-  "2025-08-01","2025-10-20","2025-12-25","2025-12-26"
-]);
-function isSunday(d) { return dayjs.tz(d, TZ).day() === 0; }
-function isHoliday(d) { return JM_HOLIDAYS_2025.has(dayjs.tz(d, TZ).format("YYYY-MM-DD")); }
-function isOpenBusinessDay(d) {
-  const dj = dayjs.tz(d, TZ);
-  return dj.day() !== 0 && !isHoliday(dj);
-}
-function nextBusinessDay(d) {
-  let dj = dayjs.tz(d, TZ).add(1, "day");
-  while (!isOpenBusinessDay(dj)) dj = dj.add(1, "day");
-  return dj.format("YYYY-MM-DD");
-}
+});
 
 // ------------------------ Retell Action ------------------
-// Global after-hours guard: booking allowed anytime; transfer/route after-hours => message-taking.
+const RETELL_API_KEY = process.env.RETELL_API_KEY || "";
+const RETELL_AGENT_ID = process.env.RETELL_AGENT_ID || "";
+
+// Outbound call helper (Retell)
+async function retellCall({ to, from, variables = {}, call_type = "reminder" }) {
+  if (!RETELL_API_KEY || !RETELL_AGENT_ID) {
+    console.warn("[Retell] Missing RETELL_API_KEY / RETELL_AGENT_ID; skipping call");
+    return { ok: false, error: "missing_retell_keys" };
+  }
+  try {
+    const r = await axios.post(
+      "https://api.retellai.com/v2/calls",
+      {
+        agent_id: RETELL_AGENT_ID,
+        to_number: to,
+        from_number: from || process.env.TELNYX_OUTBOUND_CALLER_ID,
+        metadata: { call_type, ...variables },
+      },
+      { headers: { Authorization: `Bearer ${RETELL_API_KEY}` } }
+    );
+    return { ok: true, data: r.data };
+  } catch (e) {
+    console.error("[Retell] outbound error:", e?.response?.data || e.message);
+    return { ok: false, error: e.message };
+  }
+}
+
 app.post("/retell/action", async (req, res) => {
   try {
-    const event  = req.body || {};
+    const event = req.body || {};
     const action = String(event.action || "").toLowerCase();
-    const branch = String(event.branch || "winchester").toLowerCase();
 
-    // testing override
-    const tokenOk =
-      !process.env.STATUS_TOKEN ||
-      req.query.token === process.env.STATUS_TOKEN ||
-      req.get("x-status-token") === process.env.STATUS_TOKEN;
-    const forceOpen =
-      tokenOk && (req.query.force_open === "1" || event.force_open === true);
-
-    // After-hours guard for human transfers
-    const wantsHuman =
-      action.includes("transfer") ||
-      action.includes("route") ||
-      action.includes("route_human") ||
-      action.includes("connect");
-
-    if (wantsHuman && !isOpenNow(branch) && !forceOpen) {
-      const nextOpen = nextOpenString(branch);
-      return res.json({
-        ok: true,
-        response: `Thank you for holding. Our ${branch} office is currently closed. I can take your name, number, and a brief message for the team to return your call ${nextOpen}. Would you like me to do that now?`
-      });
-    }
-
-    // BOOK (allowed anytime)
+    // Book (procedure or consult)
     if (action.includes("book")) {
       const r = await Calendar.createEvent({
         physician: event.physician,
-        start: event.start,
-        end: event.end,
-        summary: event.summary,
-        phone: event.phone,
-        note: event.note,
-        patientName: event.name || event.patientName,
-        patientPhone: event.phone || event.patientPhone,
+        start: event.start, end: event.end,
+        summary: event.service || event.summary,
+        service: event.service, phone: event.phone,
+        note: { ...event.note, branch: event.branch, service: event.service },
         branch: event.branch,
       });
+      const who = event.service ? "procedure" : "appointment";
       return res.json({
-        ok: true,
-        response: `Booked for ${PHYSICIAN_DISPLAY[r.key] || r.key}.`,
-        eventId: r.event.id,
-        htmlLink: r.event.htmlLink
+        ok:true,
+        response:`Booked ${who}${event.service ? ` (${event.service})` : ""}${event.physician ? ` for ${event.physician}` : ""}.`,
+        eventId:r.event.id
       });
     }
 
-    // NEXT AVAILABILITY
+    // Next appointment for physician
     if (action.includes("next")) {
       const u = await Calendar.upcoming(event.physician, 1);
-      if (!u.items.length) return res.json({ ok: true, response: "No upcoming events." });
+      if (!u.items.length) return res.json({ ok:true, response:"No upcoming events." });
       const first = u.items[0];
       return res.json({
-        ok: true,
-        response: `Next for ${PHYSICIAN_DISPLAY[u.key] || u.key}: ${first.summary} at ${first.start?.dateTime || first.start?.date}`,
-        eventId: first.id
+        ok:true,
+        response:`Next for ${PHYSICIAN_DISPLAY[u.key] || u.key}: ${first.summary} at ${first.start?.dateTime || first.start?.date}`,
+        eventId:first.id
       });
     }
 
-    // HOURS query
-    if (action.includes("hours")) {
-      const open = isOpenNow(branch);
-      if (branch === "portmore") {
-        return res.json({
-          ok: true,
-          response: open
-            ? "Yes, our Portmore office is currently open: Monday to Friday 10 AM to 5 PM, and Saturdays 10 AM to 2 PM."
-            : `We’re currently closed. Portmore hours are Monday to Friday 10 AM to 5 PM, and Saturdays 10 AM to 2 PM. We’ll reopen ${nextOpenString(branch)}.`
-        });
-      }
-      return res.json({
-        ok: true,
-        response: open
-          ? `Yes, our ${branch} office is open: Monday to Friday 8:30 AM to 4:30 PM.`
-          : `We’re currently closed. ${branch} hours are Monday to Friday 8:30 AM to 4:30 PM. We’ll reopen ${nextOpenString(branch)}.`
+    // Connect test (outbound)
+    if (action.includes("connect")) {
+      const result = await retellCall({
+        to: event.to, from: event.from, call_type: "connect_test",
+        variables: { note: event.note || "" }
       });
+      return res.json({ ok: true, response: result.ok ? "Call placed." : `Failed: ${result.error}` });
     }
 
-    // TRANSFER (Retell performs bridge)
-    if (action.includes("transfer")) {
-      const to = BRANCH_NUMBERS[branch] || BRANCH_NUMBERS.winchester;
-      const open = isOpenNow(branch);
-      console.log(`[Transfer] action=transfer branch=${branch} to=${to} open=${open} at=${dayjs().tz(TZ).format("YYYY-MM-DD HH:mm:ss")}`);
-      return res.json({
-        ok: true,
-        response: `One moment please while I connect you to our ${branch} branch.`,
-        connect: { to },
-        transferPolicy: { ringSeconds: Math.ceil((Number(process.env.HANDOFF_TIMEOUT_MS || 25000))/1000) }
-      });
-    }
-
-    // MESSAGE (email summary to branch inbox)
-    if (action.includes("message")) {
-      const transporter = makeTransport();
-      if (transporter) {
-        const b = branch || "winchester";
-        const to = BRANCH_EMAILS[b] || BRANCH_EMAILS.winchester;
-        const subj = `[PRIORITY] ${b} | ${event.reason || "General"} – ${event.name || "Caller"}`;
-        const html = `
-          <p><b>NEW MESSAGE – ${b.toUpperCase()}</b></p>
-          <p><b>Caller:</b> ${event.name || "Unknown"}<br/>
-          <b>Phone:</b> ${event.phone || "Unknown"}<br/>
-          <b>Reason:</b> ${event.reason || "General"}<br/>
-          <b>Summary:</b> ${(event.summary || "").replace(/\n/g,"<br/>")}<br/>
-          <b>Preferred callback:</b> ${event.preferred_callback || "—"}<br/>
-          <b>Urgency:</b> ${(event.urgency || "routine").toUpperCase()}<br/>
-          <b>Tone:</b> ${event.tone || "calm"}</p>
-          <p><i>Recorded by: Kimberley – AI Receptionist</i></p>`;
-        await transporter.sendMail({ from: FROM_EMAIL, to, subject: subj, html });
-      } else {
-        console.warn("[Message] SMTP not configured; skipped email.");
-      }
-      return res.json({
-        ok: true,
-        response: "Thank you. I’ll make sure this is passed along to the right team. Someone will return your call shortly."
-      });
-    }
-
-    // -------- Birthday maintenance actions --------
-    if (action === "update_dob" || action === "dob_update") {
-      const phone = event?.patient?.phone || event.phone;
-      const name  = event?.patient?.full_name || event.patient_name;
-      const newDob = event.dob; // YYYY-MM-DD
-      if (!phone || !newDob) return res.json({ ok: false, response: "Missing phone or DOB." });
-
-      const row = await findBirthdayRowByPhoneOrName(phone, name);
-      if (!row) return res.json({ ok: false, response: "Patient not found in birthday list." });
-
-      await writeBirthdayRow(row.rowIndex, {
-        dob_correction: newDob,
-        last_outcome: "corrected_dob",
-        last_outcome_ts: dayjs().tz(TZ).toISOString(),
-        status_flag: "needs_review",
-        status_note: "DOB correction submitted by Kimberley"
-      });
-
-      // optional email to branch
-      try {
-        const t = makeTransport();
-        const to = BRANCH_EMAILS[row.branch] || BRANCH_EMAILS.winchester;
-        await t?.sendMail({
-          from: FROM_EMAIL, to,
-          subject: `DOB correction submitted – ${row.full_name}`,
-          html: `<p>Kimberley captured a DOB correction.</p>
-                 <p><b>Patient:</b> ${row.full_name} (${row.phone_e164})</p>
-                 <p><b>New DOB:</b> ${newDob}</p>
-                 <p>Please verify and update <b>dob_yyyy_mm_dd</b> in the sheet, then clear <b>dob_correction</b>.</p>`
-        });
-      } catch {}
-      return res.json({ ok: true, response: "Thanks — I’ve sent that update to our team." });
-    }
-
-    if (action === "mark_wrong_number") {
-      const phone = event?.patient?.phone || event.phone;
-      const name  = event?.patient?.full_name || event.patient_name;
-      const row = await findBirthdayRowByPhoneOrName(phone, name);
-      if (!row) return res.json({ ok: false, response: "Record not found." });
-
-      await writeBirthdayRow(row.rowIndex, {
-        opt_out: "yes",
-        opt_out_reason: "wrong_number",
-        status_flag: "wrong_number",
-        status_note: "Marked by Kimberley",
-        last_outcome: "wrong_number",
-        last_outcome_ts: dayjs().tz(TZ).toISOString()
-      });
-      return res.json({ ok: true, response: "Noted. We won’t call this number again." });
-    }
-
-    if (action === "mark_deceased") {
-      const phone = event?.patient?.phone || event.phone;
-      const name  = event?.patient?.full_name || event.patient_name;
-      const row = await findBirthdayRowByPhoneOrName(phone, name);
-      if (!row) return res.json({ ok: false, response: "Record not found." });
-
-      await writeBirthdayRow(row.rowIndex, {
-        opt_out: "yes",
-        opt_out_reason: "deceased",
-        status_flag: "deceased",
-        status_note: "Marked by Kimberley",
-        last_outcome: "deceased",
-        last_outcome_ts: dayjs().tz(TZ).toISOString()
-      });
-      return res.json({ ok: true, response: "Our sincere condolences. We’ve updated our records." });
-    }
-
-    if (action === "opt_out") {
-      const phone = event?.patient?.phone || event.phone;
-      const name  = event?.patient?.full_name || event.patient_name;
-      const reason = event.reason || "request";
-      const row = await findBirthdayRowByPhoneOrName(phone, name);
-      if (!row) return res.json({ ok: false, response: "Record not found." });
-
-      await writeBirthdayRow(row.rowIndex, {
-        opt_out: "yes",
-        opt_out_reason: reason,
-        last_outcome: "opt_out",
-        last_outcome_ts: dayjs().tz(TZ).toISOString()
-      });
-      return res.json({ ok: true, response: "Understood. We’ll stop calls to this number." });
-    }
-
-    if (action === "update_contact") {
-      const phone = event?.patient?.phone || event.phone;
-      const name  = event?.patient?.full_name || event.patient_name;
-      const newPhone = event.new_phone_candidate || event.new_phone;
-      const caregiverName  = event.caregiver_name || "";
-      const caregiverPhone = event.caregiver_phone || "";
-      const row = await findBirthdayRowByPhoneOrName(phone, name);
-      if (!row) return res.json({ ok: false, response: "Record not found." });
-
-      await writeBirthdayRow(row.rowIndex, {
-        new_phone_candidate: newPhone || "",
-        caregiver_name: caregiverName,
-        caregiver_phone: caregiverPhone,
-        status_flag: "needs_review",
-        status_note: "New contact info submitted by Kimberley",
-        last_outcome: "contact_update",
-        last_outcome_ts: dayjs().tz(TZ).toISOString()
-      });
-      return res.json({ ok: true, response: "Thank you, I’ve noted the updated contact details." });
-    }
-
-    // default
-    return res.json({ ok: true, response: "Ready." });
+    return res.json({ ok:true, response:"Ready." });
   } catch (err) {
     console.error("[/retell/action] error:", err?.response?.data || err.message);
-    res.json({ ok: false, response: "Error." });
+    res.json({ ok:false, response:"Error." });
   }
 });
 
-// ------------------------ Status Dashboard --------------------------
-function requireStatusAuth(req, res) {
-  const must = process.env.STATUS_TOKEN;
-  if (!must) return true;
-  const token = req.query.token || req.get("x-status-token");
-  if (token === must) return true;
-  res.status(401).send("Unauthorized");
-  return false;
-}
-async function checkGoogleCalendar() {
-  try { const auth = getJWTAuth(); await auth.getAccessToken(); return { ok: true, note: "Google auth OK" }; }
-  catch (e) { return { ok: false, note: e?.message || "Google auth failed" }; }
-}
-async function checkSMTP() {
-  try { const t = makeTransport(); if (!t) return { ok: false, note: "SMTP not configured" }; await t.verify(); return { ok: true, note: "SMTP connection OK" }; }
-  catch (e) { return { ok: false, note: e?.message || "SMTP verify failed" }; }
-}
-function summarizeConfig() {
-  const hasGoogleJson = !!process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
-  const hasGoogleB64 = !!process.env.GOOGLE_CREDENTIALS_B64;
-  return {
-    branch_numbers: BRANCH_NUMBERS,
-    branch_emails: BRANCH_EMAILS,
-    moh_url: MOH_URL,
-    handoff_timeout_ms: HANDOFF_TIMEOUT_MS,
-    google_creds: hasGoogleJson ? "inline JSON" : (hasGoogleB64 ? "base64" : "missing"),
-    smtp_host: process.env.SMTP_HOST || null,
-    from_email: FROM_EMAIL,
-    birthdays_sheet_id: BIRTHDAYS_SHEET_ID ? "set" : "missing"
-  };
-}
-app.get("/status.json", async (req, res) => {
-  if (!requireStatusAuth(req, res)) return;
-  const [google, smtp] = await Promise.all([checkGoogleCalendar(), checkSMTP()]);
-  res.json({
-    ok: google.ok && smtp.ok,
-    time: new Date().toISOString(),
-    uptime_seconds: Math.round(process.uptime()),
-    checks: { google, smtp },
-    config: summarizeConfig(),
-    endpoints: { health: "/health", action_server: "/retell/action", status_html: "/status" }
-  });
-});
-app.get("/status", async (req, res) => {
-  if (!requireStatusAuth(req, res)) return;
-  const [google, smtp] = await Promise.all([checkGoogleCalendar(), checkSMTP()]);
-  const cfg = summarizeConfig();
-  const ok = google.ok && smtp.ok;
-  const badge = (b) => b ? `<span class="ok">OK</span>` : `<span class="fail">FAIL</span>`;
-  const row = (k, v) => `<tr><td>${k}</td><td>${v ?? ""}</td></tr>`;
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.send(`<!doctype html><html><head><meta charset="utf-8"/>
-  <title>WHC PBX Status</title>
-  <style>
-    body { font-family:system-ui, sans-serif; margin:24px; color:#111; }
-    .ok{background:#ecfdf5;color:#065f46;padding:2px 8px;border-radius:999px;font-weight:600;}
-    .fail{background:#fef2f2;color:#991b1b;padding:2px 8px;border-radius:999px;font-weight:600;}
-    table{width:100%;border-collapse:collapse;}
-    td{border-bottom:1px solid #eee;padding:6px 4px;vertical-align:top;}
-    h3{margin-top:24px;}
-  </style></head><body>
-  <h1>WHC PBX Status ${badge(ok)}</h1>
-  <p><b>Time:</b> ${dayjs().tz(TZ).format("YYYY-MM-DD HH:mm:ss")}</p>
-  <p><b>Uptime:</b> ${Math.round(process.uptime())}s</p>
-  <h3>Checks</h3>
-  <table>${row("Google Calendar", `${badge(google.ok)} ${google.note}`)}${row("SMTP", `${badge(smtp.ok)} ${smtp.note}`)}</table>
-  <h3>Config</h3>
-  <table>${row("MOH URL", cfg.moh_url)}${row("Handoff Timeout (ms)", cfg.handoff_timeout_ms)}${row("Google Credentials", cfg.google_creds)}${row("SMTP Host", cfg.smtp_host)}${row("From Email", cfg.from_email)}${row("Birthdays Sheet", cfg.birthdays_sheet_id)}</table>
-  <h3>Branch Numbers</h3>
-  <table>${row("Winchester", cfg.branch_numbers.winchester)}${row("Portmore", cfg.branch_numbers.portmore)}${row("Ardenne", cfg.branch_numbers.ardenne)}${row("Sav", cfg.branch_numbers.sav)}</table>
-  </body></html>`);
-});
+// ------------------------ Telnyx PBX ---------------------
+const TELNYX_API_KEY = process.env.TELNYX_API_KEY;
+const TELNYX_CONNECTION_ID = process.env.TELNYX_CONNECTION_ID;
+const TELNYX_OUTBOUND_CALLER_ID = process.env.TELNYX_OUTBOUND_CALLER_ID;
 
-// --------------- Scheduled Job: reminders & follow-ups ---------------
-app.post("/jobs/run-reminders", async (req, res) => {
+const telnyx = TELNYX_API_KEY
+  ? axios.create({
+      baseURL: "https://api.telnyx.com/v2/",
+      headers: { Authorization: `Bearer ${TELNYX_API_KEY}` },
+    })
+  : null;
+
+async function tx(cmd, payload) {
+  if (!telnyx) throw new Error("Telnyx not configured");
+  return telnyx.post(`call_commands/${cmd}`, payload);
+}
+
+function resolveBranchFromMeta(meta = {}) {
+  const m = (meta.branch || meta.forwarded_from || "").toString().toLowerCase();
+  if (m.includes("portmore")) return "portmore";
+  if (m.includes("ardenne")) return "ardenne";
+  if (m.includes("sav")) return "sav";
+  return "winchester";
+}
+
+// Inbound webhook with after-hours guard
+app.post("/telnyx/inbound", async (req, res) => {
+  if (!telnyx) return res.status(200).json({ ok: true, note: "Telnyx not configured" });
   try {
-    const must = process.env.STATUS_TOKEN;
-    const token = req.query.token || req.get("x-status-token");
-    if (must && token !== must) return res.status(401).json({ ok: false, error: "Unauthorized" });
+    const data = req.body?.data || {};
+    const eventType = data?.event_type;
+    const payload = data?.payload || {};
+    const callControlId = payload.call_control_id;
 
-    if (!shouldCallNow()) {
-      return res.json({ ok: true, note: "Outside calling window; skipped." });
-    }
+    console.log("[Telnyx]", eventType);
 
-    const auth = getJWTAuth();
-    const calendar = google.calendar({ version: "v3", auth });
+    if (eventType === "call.initiated") {
+      await tx("answer", { call_control_id: callControlId });
+      await tx("playback_start", { call_control_id: callControlId, audio_url: MOH_URL, overlay:true, loop:true });
 
-    const physicianKeys = Object.keys(PHYSICIANS);
-    const results = [];
+      const branchMeta = payload.client_state ? JSON.parse(Buffer.from(payload.client_state, "base64").toString("utf8")) : {};
+      const branch = resolveBranchFromMeta(branchMeta);
 
-    for (const key of physicianKeys) {
-      const calendarId = PHYSICIANS[key];
-      const timeMin = new Date(Date.now() - 2*24*3600e3).toISOString(); // back 2 days (follow-ups)
-      const timeMax = new Date(Date.now() + 8*24*3600e3).toISOString(); // ahead 8 days (7/3/1d)
-      const { data } = await calendar.events.list({
-        calendarId, timeMin, timeMax, singleEvents: true, orderBy: "startTime"
+      // AFTER-HOURS GUARD: if closed, skip transfer & trigger voicemail email
+      if (isAfterHours(branch, new Date())) {
+        await tx("playback_stop", { call_control_id: callControlId });
+        await sendVoicemailEmail({
+          branch,
+          caller: payload?.from || payload?.from_number || "Unknown",
+          recordingUrl: "(no recording)",
+          transcript: null,
+        });
+        // Optional: say line closed message (requires TTS; omitted here)
+        return res.json({ ok:true, note:"after-hours, message taken" });
+      }
+
+      const target = BRANCH_NUMBERS[branch] || BRANCH_NUMBERS.winchester;
+      await tx("transfer", {
+        call_control_id: callControlId,
+        to: target,
+        from: TELNYX_OUTBOUND_CALLER_ID,
+        timeout_secs: Math.ceil(HANDOFF_TIMEOUT_MS / 1000),
       });
-
-      let actions = 0;
-      for (const ev of (data.items || [])) {
-        const startISO = ev.start?.dateTime || ev.start?.date;
-        if (!startISO) continue;
-
-        const priv = ev.extendedProperties?.private || {};
-        const patientName  = priv.patient_name || null;
-        const patientPhone = priv.patient_phone || null;
-        const branch       = priv.branch || "winchester";
-        if (!patientPhone) continue;
-
-        let changed = false;
-
-        // pre-visit reminders
-        for (const win of dueWindowsFor(startISO)) {
-          const flag = `reminded_${win}`;
-          if (!priv[flag]) {
-            await callPatient({
-              phone: patientPhone,
-              patientName,
-              apptTime: startISO,
-              branch,
-              callType: "reminder"
-            });
-            priv[flag] = "true";
-            actions++; changed = true;
-          }
-        }
-
-        // post-visit follow-up (~1 day after end)
-        const endISO = ev.end?.dateTime || ev.end?.date || startISO;
-        const minsSinceEnd = -minutesUntil(endISO); // positive after end
-        if (minsSinceEnd >= (24*60 - 15) && minsSinceEnd <= (24*60 + 15) && !priv.followup_1d) {
-          await callPatient({
-            phone: patientPhone,
-            patientName,
-            apptTime: startISO,
-            branch,
-            callType: "followup"
-          });
-          priv.followup_1d = "true";
-          actions++; changed = true;
-        }
-
-        if (changed) {
-          await calendar.events.patch({
-            calendarId, eventId: ev.id,
-            requestBody: { extendedProperties: { private: priv } }
-          });
-        }
-      }
-      results.push({ physician: key, scanned: (data.items || []).length, actions });
+      return res.json({ ok:true });
     }
 
-    res.json({ ok: true, results });
-  } catch (e) {
-    console.error("[/jobs/run-reminders]", e.response?.data || e.message);
-    res.status(500).json({ ok: false, error: e.message });
+    if (eventType === "call.bridged") {
+      await tx("playback_stop", { call_control_id: callControlId });
+      return res.json({ ok:true });
+    }
+
+    if (eventType === "call.ended" || eventType === "transfer.failed") {
+      const branchMeta = payload.client_state ? JSON.parse(Buffer.from(payload.client_state, "base64").toString("utf8")) : {};
+      const branch = resolveBranchFromMeta(branchMeta);
+      await sendVoicemailEmail({
+        branch,
+        caller: payload?.from || payload?.from_number || "Unknown",
+        recordingUrl: "(no recording in this minimal build)",
+        transcript: null,
+      });
+      return res.json({ ok:true });
+    }
+
+    res.json({ ok:true });
+  } catch (err) {
+    console.error("[/telnyx/inbound] error:", err?.response?.data || err.message);
+    res.status(200).json({ ok:true }); // acknowledge to avoid retries
   }
 });
 
-// --------------- Scheduled Job: birthday calls (with deferral) ---------------
-app.post("/jobs/run-birthdays", async (req, res) => {
+// ------------------------ Jobs: Reminders & Birthdays ------------------
+// Google Sheets client
+async function getSheets() {
+  const auth = getJWTAuth(["https://www.googleapis.com/auth/spreadsheets"]);
+  return google.sheets({ version: "v4", auth });
+}
+
+// Parse "Phone: +1876..." line from event description
+function extractPhoneFromDescription(desc="") {
+  const m = desc.match(/Phone:\s*([+\d][\d\s\-()]+)/i);
+  return m ? m[1].replace(/[^\d+]/g,"") : null;
+}
+
+// Secure middleware for jobs/status
+function requireStatusToken(req, res, next){
+  const t = req.query.token || req.headers["x-status-token"];
+  if (!STATUS_TOKEN || t !== STATUS_TOKEN) return res.status(401).json({ ok:false, error:"unauthorized" });
+  next();
+}
+
+// Reminders (7/3/1 days before) + Follow-ups (1 day after)
+app.post("/jobs/run-reminders", requireStatusToken, async (req, res) => {
   try {
-    const must = process.env.STATUS_TOKEN;
-    const token = req.query.token || req.get("x-status-token");
-    if (must && token !== must) return res.status(401).json({ ok: false, error: "Unauthorized" });
+    const today = new Date();
+    const results = [];
+    for (const physKey of Object.keys(PHYSICIANS)) {
+      const { items } = await Calendar.upcoming(physKey, 50);
+      for (const ev of items) {
+        const startIso = ev.start?.dateTime || ev.start?.date;
+        if (!startIso) continue;
+        const start = new Date(startIso);
+        const daysDiff = Math.round((start - today) / (1000*60*60*24));
+        const desc = ev.description || "";
+        const phone = extractPhoneFromDescription(desc);
+        const branchMatch = desc.match(/Branch:\s*(\w+)/i);
+        const branch = branchMatch ? branchMatch[1].toLowerCase() : "winchester";
 
-    const today = dayjs().tz(TZ);
-    const todayIso = today.format("YYYY-MM-DD");
-    const todayMMDD = today.format("MM-DD");
-    const thisYear = today.year();
+        // Reminders 7/3/1 days
+        if ([7,3,1].includes(daysDiff) && phone) {
+          const payload = {
+            to: phone,
+            variables: {
+              call_type: "reminder",
+              appointment_time: start.toISOString(),
+              branch,
+              physician: PHYSICIAN_DISPLAY[physKey] || physKey
+            }
+          };
+          const r = await retellCall({ to: phone, call_type:"reminder", variables: payload.variables });
+          results.push({ eventId: ev.id, phone, daysDiff, ok: r.ok });
+        }
 
-    const rows = await readBirthdaySheet();
-    const clean = (s) => String(s || "").trim();
+        // Follow-up (1 day after)
+        const daysAfter = Math.round((today - start) / (1000*60*60*24));
+        if (daysAfter === 1 && phone) {
+          const r = await retellCall({
+            to: phone, call_type:"followup",
+            variables: { branch, physician: PHYSICIAN_DISPLAY[physKey] || physKey }
+          });
+          results.push({ eventId: ev.id, phone, followup:true, ok: r.ok });
+        }
+      }
+    }
+    res.json({ ok:true, results });
+  } catch (err) {
+    console.error("[/jobs/run-reminders] error:", err?.response?.data || err.message);
+    res.status(500).json({ ok:false, error: err.message });
+  }
+});
 
-    // Closed day (Sunday/holiday): mark deferrals and exit
-    if (!isOpenBusinessDay(today)) {
-      const toDefer = rows.filter(r =>
-        clean(r.dob_yyyy_mm_dd).slice(5) === todayMMDD &&
-        !clean(r.opt_out) &&
-        clean(r.last_called_year) !== String(thisYear)
-      );
-      const carryTo = toDefer.length ? nextBusinessDay(today) : null;
-      for (const r of toDefer) {
-        await writeBirthdayRow(r.rowIndex, {
-          deferred_for_yyyy_mm_dd: carryTo,
-          deferred_reason: isSunday(today) ? "sunday" : "holiday",
-          last_outcome: "deferred",
-          last_outcome_ts: today.toISOString()
+// Birthday calls (Google Sheet)
+app.post("/jobs/run-birthdays", requireStatusToken, async (req, res) => {
+  try {
+    const SHEET_ID = process.env.BIRTHDAYS_SHEET_ID;
+    if (!SHEET_ID) return res.status(400).json({ ok:false, error:"missing BIRTHDAYS_SHEET_ID" });
+    const sheets = await getSheets();
+
+    // Expect header row; range A:Z is safe default
+    const range = "Sheet1!A:Z";
+    const { data } = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range });
+    const rows = data.values || [];
+    if (!rows.length) return res.json({ ok:true, note:"no rows" });
+
+    const header = rows[0].map(h => String(h||"").trim().toLowerCase());
+    const idx = (name) => header.indexOf(name);
+    const iName = idx("full_name");
+    const iPhone = idx("phone_e164");
+    const iDob = idx("dob_yyyy_mm_dd");
+    const iBranch = idx("branch");
+    const iOptOut = idx("opt_out");
+    const iLastYear = idx("last_called_year");
+
+    const today = new Date();
+    const mmdd = ("0"+(today.getMonth()+1)).slice(-2) + "-" + ("0"+today.getDate()).slice(-2);
+    const currentYear = today.getFullYear();
+    const out = [];
+
+    for (let r = 1; r < rows.length; r++) {
+      const row = rows[r];
+      const name = row[iName] || "";
+      const phone = row[iPhone] || "";
+      const dob = row[iDob] || "";
+      const branch = (row[iBranch] || "winchester").toLowerCase();
+      const optOut = String(row[iOptOut] || "").toLowerCase() === "yes";
+      const lastYear = Number(row[iLastYear] || 0);
+
+      if (!phone || !dob || optOut) continue;
+      const dobMmdd = dob.slice(5,10);
+      if (dobMmdd !== mmdd) continue;
+      if (lastYear === currentYear) continue;
+
+      const rCall = await retellCall({
+        to: phone, call_type:"birthday",
+        variables: { patient_name: name, branch }
+      });
+      out.push({ row:r+1, name, phone, ok: rCall.ok });
+
+      // Write back last_called_year
+      if (iLastYear >= 0 && rCall.ok) {
+        const rangeWrite = `Sheet1!${String.fromCharCode(65 + iLastYear)}${r+1}`;
+        await sheets.spreadsheets.values.update({
+          spreadsheetId: SHEET_ID, range: rangeWrite, valueInputOption:"RAW",
+          requestBody: { values: [[ String(currentYear) ]] }
         });
       }
-      return res.json({ ok: true, closed_today: true, deferred: toDefer.length, carry_to: carryTo });
     }
 
-    // Open day: due = (today's birthdays OR deferred to today), not opted out, not already called this year, not paused
-    const due = rows.filter(r => {
-      const mmdd = clean(r.dob_yyyy_mm_dd).slice(5);
-      const deferredFor = clean(r.deferred_for_yyyy_mm_dd);
-      const notCalledThisYear = clean(r.last_called_year) !== String(thisYear);
-      const ok = !clean(r.opt_out);
-      const paused = !!clean(r.pause_until_yyyy_mm_dd) && dayjs.tz(r.pause_until_yyyy_mm_dd, TZ).isAfter(today, "day");
-      return ok && !paused && notCalledThisYear && (mmdd === todayMMDD || deferredFor === todayIso);
+    res.json({ ok:true, processed: out.length, details: out });
+  } catch (err) {
+    console.error("[/jobs/run-birthdays] error:", err?.response?.data || err.message);
+    res.status(500).json({ ok:false, error: err.message });
+  }
+});
+
+// ------------------------ Diagnostics --------------------
+app.get("/status.json", requireStatusToken, async (req, res) => {
+  try {
+    // quick checks
+    const checks = {
+      smtp: !!(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS),
+      google_creds: !!(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON || process.env.GOOGLE_CREDENTIALS_B64),
+      telnyx: !!TELNYX_API_KEY,
+      retell: !!(RETELL_API_KEY && RETELL_AGENT_ID),
+      proc_cals: Object.values(PROCEDURE_CALENDARS).every(Boolean),
+    };
+    res.json({
+      ok:true,
+      time: new Date().toISOString(),
+      checks,
+      branches: { numbers: BRANCH_NUMBERS, emails: BRANCH_EMAILS },
+      physicians: Object.keys(PHYSICIANS),
     });
-
-    // Respect calling hours inside the open day
-    if (!shouldCallNow()) {
-      return res.json({ ok: true, note: "Outside calling hours; will try later today.", candidates: due.length });
-    }
-
-    let placed = 0;
-    for (const r of due) {
-      try {
-        const resp = await callPatient({
-          phone: r.phone_e164,
-          patientName: r.full_name,
-          branch: r.branch,
-          callType: "birthday",
-        });
-        placed++;
-        await writeBirthdayRow(r.rowIndex, {
-          last_called_year: String(thisYear),
-          last_outcome: "success",
-          last_outcome_ts: today.toISOString(),
-          deferred_for_yyyy_mm_dd: "",
-          deferred_reason: "",
-          status_note: ""
-        });
-      } catch (err) {
-        // soft retry next business day
-        await writeBirthdayRow(r.rowIndex, {
-          last_outcome: "failed",
-          last_outcome_ts: today.toISOString(),
-          deferred_for_yyyy_mm_dd: nextBusinessDay(today),
-          deferred_reason: "retry",
-          status_note: "Retry next business day"
-        });
-      }
-    }
-
-    return res.json({ ok: true, birthdays_due: due.length, calls_placed: placed });
   } catch (e) {
-    console.error("[/jobs/run-birthdays]", e.response?.data || e.message);
-    res.status(500).json({ ok: false, error: e.message });
+    res.status(500).json({ ok:false, error:e.message });
   }
 });
 
 // ------------------------ Start --------------------------
 const PORT = process.env.PORT || 8080;
-const HOST = "0.0.0.0";
-const server = http.createServer(app);
-
-server.listen(PORT, HOST, () => console.log(`WHC server listening on :${PORT}`));
-
-process.on("SIGTERM", () => {
-  console.log("Received SIGTERM, shutting down gracefully…");
-  server.close(() => {
-    console.log("HTTP server closed");
-    process.exit(0);
-  });
-  setTimeout(() => process.exit(0), 10000).unref();
-});
+app.listen(PORT, () => console.log(`WHC server listening on :${PORT}`));
