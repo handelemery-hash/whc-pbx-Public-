@@ -1,0 +1,25 @@
+name: WHC - Consults (Sync + Reminders + Followups)
+on:
+  schedule:
+    - cron: "2 14 * * *"   # 09:02 JA
+    - cron: "7 14 * * *"   # 09:07 JA
+    - cron: "12 14 * * *"  # 09:12 JA
+  workflow_dispatch: {}
+jobs:
+  sync_consults:
+    runs-on: ubuntu-latest
+    env: { BASE_URL: ${{ secrets.RAILWAY_BASE_URL }}, TOKEN: ${{ secrets.STATUS_TOKEN }} }
+    steps:
+      - run: for i in 1 2 3; do curl -sSf -X POST "$BASE_URL/jobs/sync-consults?token=$TOKEN" && break || sleep 5; done
+  consult_reminders:
+    runs-on: ubuntu-latest
+    needs: sync_consults
+    env: { BASE_URL: ${{ secrets.RAILWAY_BASE_URL }}, TOKEN: ${{ secrets.STATUS_TOKEN }} }
+    steps:
+      - run: for i in 1 2 3; do curl -sSf -X POST "$BASE_URL/jobs/run-consult-reminders?token=$TOKEN" && break || sleep 5; done
+  followups:
+    runs-on: ubuntu-latest
+    needs: sync_consults
+    env: { BASE_URL: ${{ secrets.RAILWAY_BASE_URL }}, TOKEN: ${{ secrets.STATUS_TOKEN }} }
+    steps:
+      - run: for i in 1 2 3; do curl -sSf -X POST "$BASE_URL/jobs/run-followups?token=$TOKEN" && break || sleep 5; done
