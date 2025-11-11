@@ -1,5 +1,5 @@
 // server.js — WHC PBX + Calendar + Jobs (Retell + Telnyx + Email)
-// Outbound Birthday Calls + Webhook write-back
+// Birthdays + Procedure Reminders + Webhook write-back
 // ---------------------------------------------------------------
 
 import express from "express";
@@ -36,6 +36,15 @@ app.use((req, _res, next) => {
 const HANDOFF_TIMEOUT_MS = Number(process.env.HANDOFF_TIMEOUT_MS || 25000);
 const MOH_URL = process.env.MOH_URL || "https://example.com/moh.mp3";
 const STATUS_TOKEN = process.env.STATUS_TOKEN || "";
+
+// Calling window (local minutes)
+const startMin = Number(process.env.CALL_WINDOW_START_MIN || 8 * 60);
+const endMin = Number(process.env.CALL_WINDOW_END_MIN || 18 * 60);
+const insideWindowNow = () => {
+  const t = nowTz();
+  const m = t.hour() * 60 + t.minute();
+  return m >= startMin && m <= endMin;
+};
 
 // Branch phones (for transfer targets)
 const BRANCH_NUMBERS = {
@@ -139,9 +148,7 @@ const Calendar = {
     const description = [
       phone ? `Phone: ${phone}` : null,
       note ? `Note: ${note}` : null,
-    ]
-      .filter(Boolean)
-      .join("\n");
+    ].filter(Boolean).join("\n");
 
     const { data } = await calendar.events.insert({
       calendarId: id,
@@ -159,9 +166,7 @@ const Calendar = {
   async upcoming(physician, max = 10) {
     const { key, id } = getCalendarIdForPhys(physician);
     const auth = getJWTAuth();
-    the:
     const calendar = google.calendar({ version: "v3", auth });
-
     const { data } = await calendar.events.list({
       calendarId: id,
       timeMin: new Date().toISOString(),
@@ -169,7 +174,6 @@ const Calendar = {
       singleEvents: true,
       orderBy: "startTime",
     });
-
     return { key, id, items: data.items || [] };
   },
 
@@ -298,7 +302,6 @@ app.post("/retell/action", async (req, res) => {
 });
 
 // ------------------------ Telnyx PBX ---------------------
-// Only activate if env is present
 const TELNYX_API_KEY = process.env.TELNYX_API_KEY;
 const TELNYX_CONNECTION_ID = process.env.TELNYX_CONNECTION_ID;
 const TELNYX_OUTBOUND_CALLER_ID = process.env.TELNYX_OUTBOUND_CALLER_ID;
@@ -326,8 +329,7 @@ function resolveBranchFromMeta(meta = {}) {
 
 // Office hours (local Jamaica time)
 function isOfficeOpen(branchKey, when = nowTz()) {
-  // Sun=0 ... Sat=6
-  const dow = when.day();
+  const dow = when.day(); // Sun=0 ... Sat=6
   const minutes = when.hour() * 60 + when.minute();
 
   // Closed Sundays
@@ -356,15 +358,13 @@ app.post("/telnyx/inbound", async (req, res) => {
 
     console.log("[Telnyx]", eventType);
 
-    // Answer & decision
     if (eventType === "call.initiated") {
       await tx("answer", { call_control_id: callControlId });
 
-      // Determine branch from client_state
       const meta = payload.client_state ? JSON.parse(Buffer.from(payload.client_state, "base64").toString("utf8")) : {};
       const branch = resolveBranchFromMeta(meta);
 
-      // After-hours guard
+      // After-hours guard → email + hangup
       if (!isOfficeOpen(branch)) {
         await sendVoicemailEmail({
           branch,
@@ -376,7 +376,7 @@ app.post("/telnyx/inbound", async (req, res) => {
         return res.json({ ok: true, note: "after-hours; message taken" });
       }
 
-      // In hours: MOH + transfer
+      // In hours: MOH + warm transfer
       await tx("playback_start", {
         call_control_id: callControlId,
         audio_url: MOH_URL,
@@ -431,7 +431,7 @@ function assertToken(req, res) {
   return true;
 }
 
-// No-op placeholder so your cron never fails (expand later if needed)
+// (Placeholder / keep-alive)
 app.post("/jobs/run-reminders", async (req, res) => {
   if (!assertToken(req, res)) return;
   try {
@@ -444,35 +444,27 @@ app.post("/jobs/run-reminders", async (req, res) => {
 
 // ----------------- Retell Outbound (helper) -----------------
 const ENABLE_BDAY_DIAL = String(process.env.ENABLE_BDAY_DIAL || "").trim() === "1";
+const ENABLE_PROC_DIAL = String(process.env.ENABLE_PROC_DIAL || "").trim() === "1";
+
 const RETELL_API_KEY = process.env.RETELL_API_KEY || "";
-const RETELL_OUTBOUND_AGENT_ID = process.env.RETELL_OUTBOUND_AGENT_ID || ""; // the agent profile to use for outbound
-const RETELL_OUTBOUND_FROM = process.env.RETELL_OUTBOUND_FROM || ""; // +1305... (your Retell number)
+const RETELL_OUTBOUND_AGENT_ID = process.env.RETELL_OUTBOUND_AGENT_ID || "";
+const RETELL_OUTBOUND_FROM = process.env.RETELL_OUTBOUND_FROM || ""; // +1305...
 const RETELL_OUTBOUND_URL = process.env.RETELL_OUTBOUND_URL || "https://api.retellai.com/v2/outbound-calls";
 
-// Place an outbound call via Retell. Adjust body fields if your tenant differs.
-async function placeRetellCall({
-  to,
-  from,
-  agent_id,
-  variables,
-  metadata,
-  webhook_url
-}) {
+async function placeRetellCall({ to, from, agent_id, variables, metadata, webhook_url }) {
   if (!RETELL_API_KEY || !agent_id || !from) {
     throw new Error("Retell outbound not configured");
   }
   const client = axios.create({
-    baseURL: RETELL_OUTBOUND_URL.startsWith("http") ? undefined : undefined,
     headers: { Authorization: `Bearer ${RETELL_API_KEY}` },
     timeout: 15000,
   });
   const body = { to, from, agent_id, variables, metadata, webhook_url };
   const { data } = await client.post(RETELL_OUTBOUND_URL, body);
-  // Expect { call_id: "...", status: "queued" } or similar
-  return data;
+  return data; // expect { call_id, status } or similar
 }
 
-// ------------------------ Birthday Job (Jamaica time + extra columns + outbound dial) ---------------------
+// ------------------------ Birthday Job ---------------------
 app.post("/jobs/run-birthdays", async (req, res) => {
   if (!assertToken(req, res)) return;
   try {
@@ -497,7 +489,7 @@ app.post("/jobs/run-birthdays", async (req, res) => {
     });
 
     const rows = read.data.values || [];
-    if (rows.length === 0) return res.json({ ok: true, processed: 0, details: [] });
+    if (!rows.length) return res.json({ ok: true, processed: 0, details: [] });
 
     const headers = (rows[0] || []).map(h => String(h || "").trim().toLowerCase());
     const col = (name) => headers.indexOf(String(name).trim().toLowerCase());
@@ -521,7 +513,7 @@ app.post("/jobs/run-birthdays", async (req, res) => {
       caregiver_name: col("caregiver_name"),
       caregiver_phone: col("caregiver_phone"),
       pause_until: col("pause_until_yyyy_mm_dd"),
-      last_call_id: col("last_call_id"), // OPTIONAL but recommended
+      last_call_id: col("last_call_id"),
     };
 
     const val = (r, i) => (i >= 0 && r[i] != null ? String(r[i]).trim() : "");
@@ -536,38 +528,25 @@ app.post("/jobs/run-birthdays", async (req, res) => {
     const today = nowTz();
     const todayY = today.year();
     const todayMD = today.format("MM-DD");
-
-    // Calling window (local minutes)
-    const startMin = Number(process.env.CALL_WINDOW_START_MIN || 8 * 60);
-    const endMin = Number(process.env.CALL_WINDOW_END_MIN || 18 * 60);
-    const minutesNow = today.hour() * 60 + today.minute();
-    const insideWindow = minutesNow >= startMin && minutesNow <= endMin;
+    const insideWindow = insideWindowNow();
 
     const details = [];
     const updates = [];
 
-    const rangePart = RANGE.split("!")[1] || "A:Z";
+    const rangePart = (RANGE.split("!")[1] || "A:Z");
     const startColLetter = rangePart.split(":")[0].replace(/[0-9]/g, "") || "A";
     const letterToIndex = (L) =>
       L.split("").reduce((n, ch) => n * 26 + (ch.charCodeAt(0) - 64), 0) - 1;
     const indexToLetters = (n) => {
-      let s = "";
-      n++;
-      while (n > 0) {
-        const rem = (n - 1) % 26;
-        s = String.fromCharCode(65 + rem) + s;
-        n = Math.floor((n - 1) / 26);
-      }
+      let s = ""; n++;
+      while (n > 0) { const rem = (n - 1) % 26; s = String.fromCharCode(65 + rem) + s; n = Math.floor((n - 1) / 26); }
       return s;
     };
     const startBase = letterToIndex(startColLetter.toUpperCase());
     const setCell = (rowIndex1Based, colIndex0Based, value) => {
       const targetColLetter = indexToLetters(startBase + colIndex0Based);
       const a1 = `${targetColLetter}${rowIndex1Based}`;
-      updates.push({
-        range: `${RANGE.split("!")[0]}!${a1}`,
-        values: [[value]],
-      });
+      updates.push({ range: `${RANGE.split("!")[0]}!${a1}`, values: [[value]] });
     };
 
     const offs = {
@@ -597,92 +576,204 @@ app.post("/jobs/run-birthdays", async (req, res) => {
       const newPhoneCandidate = val(row, idx.new_phone_candidate);
 
       const dob = dobCorrection || parseYmd(dobStr);
-      if (!dob || !fullName) {
-        details.push({ row: r + 1, fullName, skip: "missing_name_or_dob" });
-        continue;
-      }
+      if (!dob || !fullName) { continue; }
 
       const dobMD = dob.tz(LOCAL_TZ).format("MM-DD");
       if (dobMD !== todayMD) continue;
 
       const row1 = r + 1;
-
-      const writeOutcome = (key) => {
-        if (offs.last_outcome >= 0) setCell(row1, offs.last_outcome, key);
+      const writeOutcome = (k) => {
+        if (offs.last_outcome >= 0) setCell(row1, offs.last_outcome, k);
         if (offs.last_outcome_ts >= 0) setCell(row1, offs.last_outcome_ts, isoLocal());
       };
       const writeYearNow = () => {
         if (offs.last_called_year >= 0) setCell(row1, offs.last_called_year, String(todayY));
       };
-      const writeCallId = (id) => {
-        if (offs.last_call_id >= 0) setCell(row1, offs.last_call_id, id);
-      };
+      const writeCallId = (id) => { if (offs.last_call_id >= 0) setCell(row1, offs.last_call_id, id); };
 
-      if (optOut) {
-        writeOutcome("skipped_opt_out");
-        details.push({ row: row1, fullName, branch, reason: "opt_out", note: optOutReason });
-        continue;
-      }
+      if (optOut) { writeOutcome("skipped_opt_out"); continue; }
+      if (statusFlag === "DO_NOT_CALL" || statusFlag === "INACTIVE") { writeOutcome(`skipped_${statusFlag.toLowerCase()}`); continue; }
+      if (pauseUntil && pauseUntil.tz(LOCAL_TZ).isAfter(today, "day")) { writeOutcome("paused_until"); continue; }
+      if (deferredFor && deferredFor.tz(LOCAL_TZ).isAfter(today, "day")) { writeOutcome("deferred"); continue; }
+      if (!insideWindow) { writeOutcome("skipped_outside_window"); continue; }
+      if (!phone) { writeOutcome("skipped_missing_phone"); continue; }
+      if (String(lastCalledYear || "").trim() === String(todayY)) { writeOutcome("skipped_already_called_this_year"); continue; }
 
-      if (statusFlag === "DO_NOT_CALL" || statusFlag === "INACTIVE") {
-        writeOutcome(`skipped_${statusFlag.toLowerCase()}`);
-        details.push({ row: row1, fullName, branch, reason: "status_flag", statusFlag, statusNote });
-        continue;
-      }
-
-      if (pauseUntil && pauseUntil.tz(LOCAL_TZ).isAfter(today, "day")) {
-        writeOutcome("paused_until");
-        details.push({
-          row: row1, fullName, branch,
-          reason: "paused_until",
-          pause_until: pauseUntil.format("YYYY-MM-DD")
-        });
-        continue;
-      }
-
-      if (deferredFor && deferredFor.tz(LOCAL_TZ).isAfter(today, "day")) {
-        writeOutcome("deferred");
-        details.push({
-          row: row1, fullName, branch,
-          reason: "deferred",
-          deferred_for: deferredFor.format("YYYY-MM-DD"),
-          deferred_reason: deferredReason
-        });
-        continue;
-      }
-
-      if (!insideWindow) {
-        writeOutcome("skipped_outside_window");
-        details.push({ row: row1, fullName, branch, reason: "outside_window" });
-        continue;
-      }
-
-      if (!phone) {
-        writeOutcome("skipped_missing_phone");
-        details.push({ row: row1, fullName, branch, reason: "missing_phone", new_phone_candidate: newPhoneCandidate });
-        continue;
-      }
-
-      if (String(lastCalledYear || "").trim() === String(todayY)) {
-        writeOutcome("skipped_already_called_this_year");
-        details.push({ row: row1, fullName, branch, reason: "already_called_this_year" });
-        continue;
-      }
-
-      // ---------- Outbound call ----------
       if (ENABLE_BDAY_DIAL && RETELL_API_KEY && RETELL_OUTBOUND_AGENT_ID && RETELL_OUTBOUND_FROM) {
         try {
           const webhookUrl = `${process.env.PUBLIC_BASE_URL || ""}/retell/outbound/callback?token=${encodeURIComponent(STATUS_TOKEN)}`;
+          const meta = { kind: "birthday", sheet_id: SHEET_ID, range: RANGE, row_number: row1 };
+          const variables = { call_type: "birthday", patient_name: fullName, branch, local_time: nowTz().format("h:mm A") };
+          const dial = await placeRetellCall({
+            to: phone, from: RETELL_OUTBOUND_FROM, agent_id: RETELL_OUTBOUND_AGENT_ID,
+            variables, metadata: meta, webhook_url: webhookUrl
+          });
+          const callId = dial?.call_id || dial?.id || "";
+          writeYearNow(); writeOutcome("call_placed"); if (callId) writeCallId(callId);
+        } catch (e) { writeOutcome("dial_error"); }
+      } else {
+        writeYearNow(); writeOutcome("queued");
+      }
+    }
+
+    if (updates.length) {
+      await sheets.spreadsheets.values.batchUpdate({
+        spreadsheetId: SHEET_ID,
+        requestBody: { valueInputOption: "RAW", data: updates }
+      });
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("[/jobs/run-birthdays] error:", err?.response?.data || err.message);
+    return res.status(200).json({ ok: false, error: err.message });
+  }
+});
+
+// --------------- Procedure Reminder Job (7/3/1 days) ----------------
+app.post("/jobs/run-procedure-reminders", async (req, res) => {
+  if (!assertToken(req, res)) return;
+  try {
+    const creds = loadServiceAccountJSON();
+    const auth = new google.auth.JWT(
+      creds.client_email,
+      null,
+      creds.private_key,
+      ["https://www.googleapis.com/auth/spreadsheets"]
+    );
+    const sheets = google.sheets({ version: "v4", auth });
+
+    const SHEET_ID = process.env.PROCEDURES_SHEET_ID;
+    const RANGE = process.env.PROCEDURES_RANGE || "Sheet1!A:Z";
+    if (!SHEET_ID) return res.json({ ok: false, error: "missing PROCEDURES_SHEET_ID" });
+
+    const read = await sheets.spreadsheets.values.get({
+      spreadsheetId: SHEET_ID,
+      range: RANGE,
+      valueRenderOption: "UNFORMATTED_VALUE",
+      dateTimeRenderOption: "FORMATTED_STRING",
+    });
+
+    const rows = read.data.values || [];
+    if (!rows.length) return res.json({ ok: true, processed: 0 });
+
+    const headers = (rows[0] || []).map(h => String(h || "").trim().toLowerCase());
+    const col = (name) => headers.indexOf(String(name).trim().toLowerCase());
+    const idx = {
+      full_name: col("full_name") >= 0 ? col("full_name") : col("patient_name"),
+      phone: col("phone_e164"),
+      appt_iso: col("appt_iso"),              // optional direct ISO
+      appt_date: col("appt_yyyy_mm_dd"),     // or split fields
+      appt_time: col("appt_time_hh_mm"),     // optional HH:mm 24h
+      branch: col("branch"),
+      service: col("service"),
+      opt_out: col("opt_out"),
+      status_flag: col("status_flag"),
+      status_note: col("status_note"),
+      pause_until: col("pause_until_yyyy_mm_dd"),
+      last_reminded_offset: col("last_reminded_offset"), // last offset we called (e.g., 7 or 3 or 1)
+      last_outcome: col("last_outcome"),
+      last_outcome_ts: col("last_outcome_ts"),
+      last_call_id: col("last_call_id"),
+    };
+
+    const val = (r, i) => (i >= 0 && r[i] != null ? String(r[i]).trim() : "");
+    const asBool = (s) => /^true|1|yes|y$/i.test(String(s || "").trim());
+    const parseYmd = (s) => {
+      const t = String(s || "").trim();
+      if (!t) return null;
+      const m = dayjs(t, ["YYYY-MM-DD", "YYYY/M/D", "YYYY/M/DD", "YYYY/MM/D", "YYYY/MM/DD"], true).tz(LOCAL_TZ);
+      return m.isValid() ? m : null;
+    };
+
+    const details = [];
+    const updates = [];
+
+    const rangePart = (RANGE.split("!")[1] || "A:Z");
+    const startColLetter = rangePart.split(":")[0].replace(/[0-9]/g, "") || "A";
+    const letterToIndex = (L) => L.split("").reduce((n, ch) => n * 26 + (ch.charCodeAt(0) - 64), 0) - 1;
+    const indexToLetters = (n) => { let s=""; n++; while(n>0){const r=(n-1)%26; s=String.fromCharCode(65+r)+s; n=Math.floor((n-1)/26);} return s; };
+    const startBase = letterToIndex(startColLetter.toUpperCase());
+    const setCell = (rowIndex1Based, colIndex0Based, value) => {
+      const targetColLetter = indexToLetters(startBase + colIndex0Based);
+      const a1 = `${targetColLetter}${rowIndex1Based}`;
+      updates.push({ range: `${RANGE.split("!")[0]}!${a1}`, values: [[value]] });
+    };
+
+    const offsets = (process.env.PROC_REMINDER_OFFSETS || "7,3,1")
+      .split(",").map(s => parseInt(s.trim(), 10)).filter(n => Number.isFinite(n) && n >= 0);
+
+    const today = nowTz().startOf("day");
+    const insideWindow = insideWindowNow();
+
+    for (let r = 1; r < rows.length; r++) {
+      const row = rows[r] || [];
+      const row1 = r + 1;
+
+      const fullName = val(row, idx.full_name);
+      const phone = val(row, idx.phone);
+      const service = val(row, idx.service) || "procedure";
+      const branch = (val(row, idx.branch).toLowerCase() || "winchester");
+      const optOut = asBool(val(row, idx.opt_out));
+      const statusFlag = val(row, idx.status_flag).toUpperCase();
+      const statusNote = val(row, idx.status_note);
+      const pauseUntil = parseYmd(val(row, idx.pause_until));
+      const lastOffset = parseInt(val(row, idx.last_reminded_offset), 10);
+
+      // Build appointment datetime in LOCAL_TZ
+      let appt = null;
+      const apptIso = val(row, idx.appt_iso);
+      if (apptIso) {
+        const m = dayjs(apptIso).tz(LOCAL_TZ);
+        appt = m.isValid() ? m : null;
+      } else {
+        const d = parseYmd(val(row, idx.appt_date));
+        if (d) {
+          let timeStr = val(row, idx.appt_time);
+          if (timeStr && /^\d{1,2}:\d{2}$/.test(timeStr)) {
+            const [H, M] = timeStr.split(":").map(Number);
+            appt = d.hour(H).minute(M);
+          } else {
+            appt = d.hour(9).minute(0); // default morning if time missing
+          }
+        }
+      }
+      if (!fullName || !phone || !appt) continue;
+
+      const daysUntil = appt.startOf("day").diff(today, "day");
+      // Only handle if today matches one of the offsets
+      if (!offsets.includes(daysUntil)) continue;
+
+      if (optOut) { if (idx.last_outcome >= 0) setCell(row1, idx.last_outcome, "skipped_opt_out"); continue; }
+      if (statusFlag === "DO_NOT_CALL" || statusFlag === "INACTIVE") {
+        if (idx.last_outcome >= 0) setCell(row1, idx.last_outcome, `skipped_${statusFlag.toLowerCase()}`); continue;
+      }
+      if (pauseUntil && pauseUntil.isAfter(today, "day")) { if (idx.last_outcome >= 0) setCell(row1, idx.last_outcome, "paused_until"); continue; }
+      if (!insideWindow) { if (idx.last_outcome >= 0) setCell(row1, idx.last_outcome, "skipped_outside_window"); continue; }
+
+      // Don't repeat the same offset twice
+      if (Number.isFinite(lastOffset) && lastOffset === daysUntil) {
+        // already called at this offset
+        continue;
+      }
+
+      // Prepare variables for Retell
+      const apptNice = appt.format("dddd, MMM D [at] h:mm A");
+      if (ENABLE_PROC_DIAL && RETELL_API_KEY && RETELL_OUTBOUND_AGENT_ID && RETELL_OUTBOUND_FROM) {
+        try {
+          const webhookUrl = `${process.env.PUBLIC_BASE_URL || ""}/retell/outbound/callback?token=${encodeURIComponent(STATUS_TOKEN)}`;
           const meta = {
+            kind: "procedure",
             sheet_id: SHEET_ID,
             range: RANGE,
-            row_number: row1,   // 1-based row so webhook can update safely
+            row_number: row1,
           };
           const variables = {
-            call_type: "birthday",
+            call_type: "reminder",
             patient_name: fullName,
             branch,
-            local_time: nowTz().format("h:mm A"),
+            service,
+            appointment_time: apptNice,
           };
           const dial = await placeRetellCall({
             to: phone,
@@ -690,75 +781,54 @@ app.post("/jobs/run-birthdays", async (req, res) => {
             agent_id: RETELL_OUTBOUND_AGENT_ID,
             variables,
             metadata: meta,
-            webhook_url: webhookUrl
+            webhook_url: webhookUrl,
           });
-
           const callId = dial?.call_id || dial?.id || "";
-          writeYearNow();
-          writeOutcome("call_placed");
-          if (callId) writeCallId(callId);
-
-          details.push({
-            row: row1,
-            fullName,
-            branch,
-            action: "call_placed",
-            phone_e164: phone,
-            call_id: callId
-          });
+          if (idx.last_outcome >= 0) setCell(row1, idx.last_outcome, "call_placed");
+          if (idx.last_outcome_ts >= 0) setCell(row1, idx.last_outcome_ts, isoLocal());
+          if (idx.last_reminded_offset >= 0) setCell(row1, idx.last_reminded_offset, String(daysUntil));
+          if (idx.last_call_id >= 0 && callId) setCell(row1, idx.last_call_id, callId);
         } catch (e) {
-          writeOutcome("dial_error");
-          details.push({ row: row1, fullName, branch, action: "dial_error", error: e.message });
+          if (idx.last_outcome >= 0) setCell(row1, idx.last_outcome, "dial_error");
+          if (idx.last_outcome_ts >= 0) setCell(row1, idx.last_outcome_ts, isoLocal());
         }
       } else {
-        // If outbound disabled, just queue logically
-        writeYearNow();
-        writeOutcome("queued");
-        details.push({
-          row: row1,
-          fullName,
-          branch,
-          action: "queued",
-          phone_e164: phone,
-        });
+        // Queued in logic only
+        if (idx.last_outcome >= 0) setCell(row1, idx.last_outcome, "queued");
+        if (idx.last_outcome_ts >= 0) setCell(row1, idx.last_outcome_ts, isoLocal());
+        if (idx.last_reminded_offset >= 0) setCell(row1, idx.last_reminded_offset, String(daysUntil));
       }
     }
 
     if (updates.length) {
       await sheets.spreadsheets.values.batchUpdate({
         spreadsheetId: SHEET_ID,
-        requestBody: {
-          valueInputOption: "RAW",
-          data: updates
-        }
+        requestBody: { valueInputOption: "RAW", data: updates },
       });
     }
 
-    return res.json({ ok: true, processed: details.filter(d => d.action === "call_placed" || d.action === "queued").length, details });
+    return res.json({ ok: true });
   } catch (err) {
-    console.error("[/jobs/run-birthdays] error:", err?.response?.data || err.message);
+    console.error("[/jobs/run-procedure-reminders] error:", err?.response?.data || err.message);
     return res.status(200).json({ ok: false, error: err.message });
   }
 });
 
 // ---------------- Retell post-call webhook → update sheet ----------------
 app.post("/retell/outbound/callback", async (req, res) => {
-  // Simple shared-secret check via token (query)
   const token = String(req.query.token || "");
   if (!STATUS_TOKEN || token !== STATUS_TOKEN) return res.status(401).json({ ok: false });
 
   try {
     const body = req.body || {};
-    // Normalized fields we try to read
     const callId = body.call_id || body.id || "";
     const final = (body.final_status || body.status || "").toLowerCase();
     const meta = body.metadata || {};
 
-    const SHEET_ID = meta.sheet_id || process.env.BIRTHDAYS_SHEET_ID;
-    const RANGE = meta.range || process.env.BIRTHDAYS_RANGE || "Sheet1!A:Z";
+    const SHEET_ID = meta.sheet_id || "";
+    const RANGE = meta.range || "Sheet1!A:Z";
     const row1 = Number(meta.row_number || 0);
-
-    if (!SHEET_ID) return res.json({ ok: false, error: "missing sheet_id" });
+    if (!SHEET_ID || !row1) return res.json({ ok: true, note: "missing sheet/row" });
 
     const creds = loadServiceAccountJSON();
     const auth = new google.auth.JWT(
@@ -782,72 +852,40 @@ app.post("/retell/outbound/callback", async (req, res) => {
     const idx = {
       last_outcome: col("last_outcome"),
       last_outcome_ts: col("last_outcome_ts"),
-      last_called_year: col("last_called_year"),
+      last_called_year: col("last_called_year"), // birthday sheets only
       last_call_id: col("last_call_id"),
     };
 
-    const rangePart = RANGE.split("!")[1] || "A:Z";
+    const rangePart = (RANGE.split("!")[1] || "A:Z");
     const startColLetter = rangePart.split(":")[0].replace(/[0-9]/g, "") || "A";
-    const letterToIndex = (L) =>
-      L.split("").reduce((n, ch) => n * 26 + (ch.charCodeAt(0) - 64), 0) - 1;
-    const indexToLetters = (n) => {
-      let s = "";
-      n++;
-      while (n > 0) {
-        const rem = (n - 1) % 26;
-        s = String.fromCharCode(65 + rem) + s;
-        n = Math.floor((n - 1) / 26);
-      }
-      return s;
-    };
+    const letterToIndex = (L) => L.split("").reduce((n, ch) => n * 26 + (ch.charCodeAt(0) - 64), 0) - 1;
+    const indexToLetters = (n) => { let s=""; n++; while(n>0){const r=(n-1)%26; s=String.fromCharCode(65+r)+s; n=Math.floor((n-1)/26);} return s; };
     const startBase = letterToIndex(startColLetter.toUpperCase());
     const setCell = (rowIndex1Based, colIndex0Based, value) => {
+      if (colIndex0Based < 0) return;
       const targetColLetter = indexToLetters(startBase + colIndex0Based);
       const a1 = `${targetColLetter}${rowIndex1Based}`;
-      updates.push({
-        range: `${RANGE.split("!")[0]}!${a1}`,
-        values: [[value]],
-      });
+      updates.push({ range: `${RANGE.split("!")[0]}!${a1}`, values: [[value]] });
     };
-
-    // If the webhook didn’t carry row_number, try to locate by call_id
-    let targetRow1 = row1 || 0;
-    if (!targetRow1 && idx.last_call_id >= 0 && callId) {
-      for (let r = 1; r < rows.length; r++) {
-        const v = (rows[r] || [])[idx.last_call_id];
-        if (String(v || "").trim() === callId) {
-          targetRow1 = r + 1;
-          break;
-        }
-      }
-    }
-
-    if (!targetRow1) {
-      // No place to write, but acknowledge
-      return res.json({ ok: true, note: "no target row identified" });
-    }
 
     const updates = [];
-    const write = (c, val) => {
-      if (c >= 0) {
-        const targetColLetter = indexToLetters(startBase + c);
-        const a1 = `${targetColLetter}${targetRow1}`;
-        updates.push({ range: `${RANGE.split("!")[0]}!${a1}`, values: [[val]] });
-      }
-    };
 
-    // Map Retell final statuses to our outcomes
+    // Map outcome
     let outcome = "completed";
     if (final.includes("voicemail")) outcome = "left_voicemail";
     else if (final.includes("no_answer") || final.includes("noanswer")) outcome = "no_answer";
     else if (final.includes("cancel")) outcome = "cancelled";
     else if (final.includes("error") || final.includes("failed")) outcome = "dial_error";
-    else if (final.includes("complete")) outcome = "wished_happy_birthday";
+    else if (final.includes("complete")) {
+      outcome = meta.kind === "birthday" ? "wished_happy_birthday" : "reminder_completed";
+    }
 
-    write(idx.last_outcome, outcome);
-    write(idx.last_outcome_ts, isoLocal());
-    write(idx.last_called_year, String(nowTz().year()));
-    if (idx.last_call_id >= 0 && callId) write(idx.last_call_id, callId);
+    setCell(row1, idx.last_outcome, outcome);
+    setCell(row1, idx.last_outcome_ts, isoLocal());
+    if (meta.kind === "birthday" && idx.last_called_year >= 0) {
+      setCell(row1, idx.last_called_year, String(nowTz().year()));
+    }
+    if (idx.last_call_id >= 0 && callId) setCell(row1, idx.last_call_id, callId);
 
     if (updates.length) {
       await sheets.spreadsheets.values.batchUpdate({
@@ -868,7 +906,7 @@ app.get("/status.json", (req, res) => {
   const token = String(req.query.token || "");
   if (!STATUS_TOKEN || token !== STATUS_TOKEN) {
     return res.status(401).json({ ok: false, error: "unauthorized" });
-    }
+  }
   const haveGoogle = !!(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON || process.env.GOOGLE_CREDENTIALS_B64);
   res.json({
     ok: true,
@@ -880,9 +918,18 @@ app.get("/status.json", (req, res) => {
         sheet_id_present: !!process.env.BIRTHDAYS_SHEET_ID,
         range: process.env.BIRTHDAYS_RANGE || "Sheet1!A:Z"
       },
+      procedures: {
+        sheet_id_present: !!process.env.PROCEDURES_SHEET_ID,
+        range: process.env.PROCEDURES_RANGE || "Sheet1!A:Z",
+        offsets: (process.env.PROC_REMINDER_OFFSETS || "7,3,1")
+      },
+      outbound: {
+        retell_configured: !!(RETELL_API_KEY && RETELL_OUTBOUND_AGENT_ID && RETELL_OUTBOUND_FROM),
+        birthdays_enabled: ENABLE_BDAY_DIAL,
+        procedures_enabled: ENABLE_PROC_DIAL
+      },
       smtp_configured: !!(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS),
-      telnyx_configured: !!TELNYX_API_KEY,
-      retell_outbound_enabled: ENABLE_BDAY_DIAL
+      telnyx_configured: !!process.env.TELNYX_API_KEY
     }
   });
 });
