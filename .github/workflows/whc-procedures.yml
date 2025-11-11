@@ -1,0 +1,36 @@
+name: WHC - Procedures (Sync + Reminders)
+
+on:
+  schedule:
+    # Runs daily at 09:00 Jamaica time (UTC-5 → 14:00 UTC)
+    - cron: "0 14 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  procedures:
+    name: Sync then Remind
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      BASE_URL: ${{ secrets.RAILWAY_BASE_URL }}
+      TOKEN: ${{ secrets.STATUS_TOKEN }}
+    steps:
+      - name: Health ping (optional)
+        run: |
+          curl -sS "${BASE_URL}/health" | grep -qi "ok"
+
+      - name: Status check (optional but helpful)
+        run: |
+          curl -sS "${BASE_URL}/status.json?token=${TOKEN}" | jq .
+
+      - name: Sync procedures from Google Calendar → Sheet
+        run: |
+          for i in 1 2 3; do
+            curl -sSf -X POST "${BASE_URL}/jobs/sync-procedures?token=${TOKEN}" && break || sleep 5
+          done
+
+      - name: Procedure reminders (7/3/1 days)
+        run: |
+          for i in 1 2 3; do
+            curl -sSf -X POST "${BASE_URL}/jobs/run-procedure-reminders?token=${TOKEN}" && break || sleep 5
+          done
