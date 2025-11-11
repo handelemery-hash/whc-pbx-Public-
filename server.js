@@ -1,4 +1,5 @@
 // server.js — WHC PBX + Calendar + Jobs (Retell + Telnyx + Email)
+// Outbound Birthday Calls + Webhook write-back
 // ---------------------------------------------------------------
 
 import express from "express";
@@ -14,7 +15,6 @@ import timezone from "dayjs/plugin/timezone.js";
 dayjs.extend(utc);
 dayjs.extend(timezone);
 
-// Default to Jamaica unless overridden via env
 const LOCAL_TZ = process.env.LOCAL_TZ || "America/Jamaica";
 const nowTz = () => dayjs().tz(LOCAL_TZ);
 const isoLocal = () => nowTz().toISOString();
@@ -159,6 +159,7 @@ const Calendar = {
   async upcoming(physician, max = 10) {
     const { key, id } = getCalendarIdForPhys(physician);
     const auth = getJWTAuth();
+    the:
     const calendar = google.calendar({ version: "v3", auth });
 
     const { data } = await calendar.events.list({
@@ -267,7 +268,7 @@ app.post("/calendar/delete", async (req, res) => {
   }
 });
 
-// ------------------------ Retell Action ------------------
+// ------------------------ Retell Action (in-call) --------
 app.post("/retell/action", async (req, res) => {
   try {
     const event = req.body || {};
@@ -365,21 +366,17 @@ app.post("/telnyx/inbound", async (req, res) => {
 
       // After-hours guard
       if (!isOfficeOpen(branch)) {
-        // Optional: simple courtesy message (if you use TTS or audio file in your system)
-        // Here we just email + end (or you can record voicemail with call control).
         await sendVoicemailEmail({
           branch,
           caller: payload?.from || payload?.from_number || "Unknown",
           recordingUrl: "(no recording in this minimal build)",
           transcript: null,
         });
-
-        // Graceful hangup
         try { await tx("hangup", { call_control_id: callControlId }); } catch {}
         return res.json({ ok: true, note: "after-hours; message taken" });
       }
 
-      // In hours: play MOH then transfer
+      // In hours: MOH + transfer
       await tx("playback_start", {
         call_control_id: callControlId,
         audio_url: MOH_URL,
@@ -438,7 +435,6 @@ function assertToken(req, res) {
 app.post("/jobs/run-reminders", async (req, res) => {
   if (!assertToken(req, res)) return;
   try {
-    // Intentionally minimal: return empty result; safe for daily cron.
     return res.json({ ok: true, results: [] });
   } catch (err) {
     console.error("[/jobs/run-reminders] error:", err?.response?.data || err.message);
@@ -446,7 +442,37 @@ app.post("/jobs/run-reminders", async (req, res) => {
   }
 });
 
-// ------------------------ Birthday Job (Jamaica time + extra columns) ---------------------
+// ----------------- Retell Outbound (helper) -----------------
+const ENABLE_BDAY_DIAL = String(process.env.ENABLE_BDAY_DIAL || "").trim() === "1";
+const RETELL_API_KEY = process.env.RETELL_API_KEY || "";
+const RETELL_OUTBOUND_AGENT_ID = process.env.RETELL_OUTBOUND_AGENT_ID || ""; // the agent profile to use for outbound
+const RETELL_OUTBOUND_FROM = process.env.RETELL_OUTBOUND_FROM || ""; // +1305... (your Retell number)
+const RETELL_OUTBOUND_URL = process.env.RETELL_OUTBOUND_URL || "https://api.retellai.com/v2/outbound-calls";
+
+// Place an outbound call via Retell. Adjust body fields if your tenant differs.
+async function placeRetellCall({
+  to,
+  from,
+  agent_id,
+  variables,
+  metadata,
+  webhook_url
+}) {
+  if (!RETELL_API_KEY || !agent_id || !from) {
+    throw new Error("Retell outbound not configured");
+  }
+  const client = axios.create({
+    baseURL: RETELL_OUTBOUND_URL.startsWith("http") ? undefined : undefined,
+    headers: { Authorization: `Bearer ${RETELL_API_KEY}` },
+    timeout: 15000,
+  });
+  const body = { to, from, agent_id, variables, metadata, webhook_url };
+  const { data } = await client.post(RETELL_OUTBOUND_URL, body);
+  // Expect { call_id: "...", status: "queued" } or similar
+  return data;
+}
+
+// ------------------------ Birthday Job (Jamaica time + extra columns + outbound dial) ---------------------
 app.post("/jobs/run-birthdays", async (req, res) => {
   if (!assertToken(req, res)) return;
   try {
@@ -494,7 +520,8 @@ app.post("/jobs/run-birthdays", async (req, res) => {
       preferred_contact: col("preferred_contact"),
       caregiver_name: col("caregiver_name"),
       caregiver_phone: col("caregiver_phone"),
-      pause_until: col("pause_until_yyyy_mm_dd")
+      pause_until: col("pause_until_yyyy_mm_dd"),
+      last_call_id: col("last_call_id"), // OPTIONAL but recommended
     };
 
     const val = (r, i) => (i >= 0 && r[i] != null ? String(r[i]).trim() : "");
@@ -547,6 +574,7 @@ app.post("/jobs/run-birthdays", async (req, res) => {
       last_called_year: idx.last_called_year,
       last_outcome: idx.last_outcome,
       last_outcome_ts: idx.last_outcome_ts,
+      last_call_id: idx.last_call_id,
     };
 
     for (let r = 1; r < rows.length; r++) {
@@ -585,6 +613,9 @@ app.post("/jobs/run-birthdays", async (req, res) => {
       };
       const writeYearNow = () => {
         if (offs.last_called_year >= 0) setCell(row1, offs.last_called_year, String(todayY));
+      };
+      const writeCallId = (id) => {
+        if (offs.last_call_id >= 0) setCell(row1, offs.last_call_id, id);
       };
 
       if (optOut) {
@@ -638,18 +669,59 @@ app.post("/jobs/run-birthdays", async (req, res) => {
         continue;
       }
 
-      // Queue call (mark + year). Hook your dial-out flow here if desired.
-      writeOutcome("queued");
-      writeYearNow();
+      // ---------- Outbound call ----------
+      if (ENABLE_BDAY_DIAL && RETELL_API_KEY && RETELL_OUTBOUND_AGENT_ID && RETELL_OUTBOUND_FROM) {
+        try {
+          const webhookUrl = `${process.env.PUBLIC_BASE_URL || ""}/retell/outbound/callback?token=${encodeURIComponent(STATUS_TOKEN)}`;
+          const meta = {
+            sheet_id: SHEET_ID,
+            range: RANGE,
+            row_number: row1,   // 1-based row so webhook can update safely
+          };
+          const variables = {
+            call_type: "birthday",
+            patient_name: fullName,
+            branch,
+            local_time: nowTz().format("h:mm A"),
+          };
+          const dial = await placeRetellCall({
+            to: phone,
+            from: RETELL_OUTBOUND_FROM,
+            agent_id: RETELL_OUTBOUND_AGENT_ID,
+            variables,
+            metadata: meta,
+            webhook_url: webhookUrl
+          });
 
-      details.push({
-        row: row1,
-        fullName,
-        branch,
-        action: "queued",
-        phone_e164: phone,
-        dob_used: dob.format("YYYY-MM-DD")
-      });
+          const callId = dial?.call_id || dial?.id || "";
+          writeYearNow();
+          writeOutcome("call_placed");
+          if (callId) writeCallId(callId);
+
+          details.push({
+            row: row1,
+            fullName,
+            branch,
+            action: "call_placed",
+            phone_e164: phone,
+            call_id: callId
+          });
+        } catch (e) {
+          writeOutcome("dial_error");
+          details.push({ row: row1, fullName, branch, action: "dial_error", error: e.message });
+        }
+      } else {
+        // If outbound disabled, just queue logically
+        writeYearNow();
+        writeOutcome("queued");
+        details.push({
+          row: row1,
+          fullName,
+          branch,
+          action: "queued",
+          phone_e164: phone,
+        });
+      }
     }
 
     if (updates.length) {
@@ -662,9 +734,131 @@ app.post("/jobs/run-birthdays", async (req, res) => {
       });
     }
 
-    return res.json({ ok: true, processed: details.filter(d => d.action === "queued").length, details });
+    return res.json({ ok: true, processed: details.filter(d => d.action === "call_placed" || d.action === "queued").length, details });
   } catch (err) {
     console.error("[/jobs/run-birthdays] error:", err?.response?.data || err.message);
+    return res.status(200).json({ ok: false, error: err.message });
+  }
+});
+
+// ---------------- Retell post-call webhook → update sheet ----------------
+app.post("/retell/outbound/callback", async (req, res) => {
+  // Simple shared-secret check via token (query)
+  const token = String(req.query.token || "");
+  if (!STATUS_TOKEN || token !== STATUS_TOKEN) return res.status(401).json({ ok: false });
+
+  try {
+    const body = req.body || {};
+    // Normalized fields we try to read
+    const callId = body.call_id || body.id || "";
+    const final = (body.final_status || body.status || "").toLowerCase();
+    const meta = body.metadata || {};
+
+    const SHEET_ID = meta.sheet_id || process.env.BIRTHDAYS_SHEET_ID;
+    const RANGE = meta.range || process.env.BIRTHDAYS_RANGE || "Sheet1!A:Z";
+    const row1 = Number(meta.row_number || 0);
+
+    if (!SHEET_ID) return res.json({ ok: false, error: "missing sheet_id" });
+
+    const creds = loadServiceAccountJSON();
+    const auth = new google.auth.JWT(
+      creds.client_email,
+      null,
+      creds.private_key,
+      ["https://www.googleapis.com/auth/spreadsheets"]
+    );
+    const sheets = google.sheets({ version: "v4", auth });
+
+    const read = await sheets.spreadsheets.values.get({
+      spreadsheetId: SHEET_ID,
+      range: RANGE,
+      valueRenderOption: "UNFORMATTED_VALUE",
+      dateTimeRenderOption: "FORMATTED_STRING",
+    });
+    const rows = read.data.values || [];
+    if (!rows.length) return res.json({ ok: false, error: "empty sheet" });
+    const headers = (rows[0] || []).map(h => String(h || "").trim().toLowerCase());
+    const col = (name) => headers.indexOf(String(name).trim().toLowerCase());
+    const idx = {
+      last_outcome: col("last_outcome"),
+      last_outcome_ts: col("last_outcome_ts"),
+      last_called_year: col("last_called_year"),
+      last_call_id: col("last_call_id"),
+    };
+
+    const rangePart = RANGE.split("!")[1] || "A:Z";
+    const startColLetter = rangePart.split(":")[0].replace(/[0-9]/g, "") || "A";
+    const letterToIndex = (L) =>
+      L.split("").reduce((n, ch) => n * 26 + (ch.charCodeAt(0) - 64), 0) - 1;
+    const indexToLetters = (n) => {
+      let s = "";
+      n++;
+      while (n > 0) {
+        const rem = (n - 1) % 26;
+        s = String.fromCharCode(65 + rem) + s;
+        n = Math.floor((n - 1) / 26);
+      }
+      return s;
+    };
+    const startBase = letterToIndex(startColLetter.toUpperCase());
+    const setCell = (rowIndex1Based, colIndex0Based, value) => {
+      const targetColLetter = indexToLetters(startBase + colIndex0Based);
+      const a1 = `${targetColLetter}${rowIndex1Based}`;
+      updates.push({
+        range: `${RANGE.split("!")[0]}!${a1}`,
+        values: [[value]],
+      });
+    };
+
+    // If the webhook didn’t carry row_number, try to locate by call_id
+    let targetRow1 = row1 || 0;
+    if (!targetRow1 && idx.last_call_id >= 0 && callId) {
+      for (let r = 1; r < rows.length; r++) {
+        const v = (rows[r] || [])[idx.last_call_id];
+        if (String(v || "").trim() === callId) {
+          targetRow1 = r + 1;
+          break;
+        }
+      }
+    }
+
+    if (!targetRow1) {
+      // No place to write, but acknowledge
+      return res.json({ ok: true, note: "no target row identified" });
+    }
+
+    const updates = [];
+    const write = (c, val) => {
+      if (c >= 0) {
+        const targetColLetter = indexToLetters(startBase + c);
+        const a1 = `${targetColLetter}${targetRow1}`;
+        updates.push({ range: `${RANGE.split("!")[0]}!${a1}`, values: [[val]] });
+      }
+    };
+
+    // Map Retell final statuses to our outcomes
+    let outcome = "completed";
+    if (final.includes("voicemail")) outcome = "left_voicemail";
+    else if (final.includes("no_answer") || final.includes("noanswer")) outcome = "no_answer";
+    else if (final.includes("cancel")) outcome = "cancelled";
+    else if (final.includes("error") || final.includes("failed")) outcome = "dial_error";
+    else if (final.includes("complete")) outcome = "wished_happy_birthday";
+
+    write(idx.last_outcome, outcome);
+    write(idx.last_outcome_ts, isoLocal());
+    write(idx.last_called_year, String(nowTz().year()));
+    if (idx.last_call_id >= 0 && callId) write(idx.last_call_id, callId);
+
+    if (updates.length) {
+      await sheets.spreadsheets.values.batchUpdate({
+        spreadsheetId: SHEET_ID,
+        requestBody: { valueInputOption: "RAW", data: updates },
+      });
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("[/retell/outbound/callback] error:", err?.response?.data || err.message);
     return res.status(200).json({ ok: false, error: err.message });
   }
 });
@@ -674,7 +868,7 @@ app.get("/status.json", (req, res) => {
   const token = String(req.query.token || "");
   if (!STATUS_TOKEN || token !== STATUS_TOKEN) {
     return res.status(401).json({ ok: false, error: "unauthorized" });
-  }
+    }
   const haveGoogle = !!(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON || process.env.GOOGLE_CREDENTIALS_B64);
   res.json({
     ok: true,
@@ -687,7 +881,8 @@ app.get("/status.json", (req, res) => {
         range: process.env.BIRTHDAYS_RANGE || "Sheet1!A:Z"
       },
       smtp_configured: !!(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS),
-      telnyx_configured: !!TELNYX_API_KEY
+      telnyx_configured: !!TELNYX_API_KEY,
+      retell_outbound_enabled: ENABLE_BDAY_DIAL
     }
   });
 });
