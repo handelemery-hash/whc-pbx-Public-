@@ -1,0 +1,11 @@
+name: WHC - Birthdays
+on:
+  schedule:
+    - cron: "10 14 * * *"  # 09:10 JA
+  workflow_dispatch: {}
+jobs:
+  birthdays:
+    runs-on: ubuntu-latest
+    env: { BASE_URL: ${{ secrets.RAILWAY_BASE_URL }}, TOKEN: ${{ secrets.STATUS_TOKEN }} }
+    steps:
+      - run: for i in 1 2 3; do curl -sSf -X POST "$BASE_URL/jobs/run-birthdays?token=$TOKEN" && break || sleep 5; done
