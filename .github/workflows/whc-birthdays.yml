@@ -1,8 +1,8 @@
 name: WHC - Birthdays
 on:
   schedule:
-    - cron: "10 14 * * *"  # 09:10 JA
-  workflow_dispatch: {}
+    - cron: '0 14 * * *'  # Daily 9 AM Jamaica time
+  workflow_dispatch:       # 👈 Enables manual runs
 jobs:
   birthdays:
     runs-on: ubuntu-latest
