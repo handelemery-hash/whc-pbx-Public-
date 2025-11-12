@@ -1,11 +1,17 @@
-name: WHC - Birthdays
+name: WHC – Birthdays (Daily Calls)
+
 on:
   schedule:
-    - cron: '0 14 * * *'  # Daily 9 AM Jamaica time
-  workflow_dispatch:       # 👈 Enables manual runs
+    # Daily 9:00 AM Jamaica time (UTC-5 = 14:00 UTC)
+    - cron: '0 14 * * *'
+  workflow_dispatch:   # Enables manual Run button
+
 jobs:
-  birthdays:
+  run-birthdays:
     runs-on: ubuntu-latest
-    env: { BASE_URL: ${{ secrets.RAILWAY_BASE_URL }}, TOKEN: ${{ secrets.STATUS_TOKEN }} }
+    timeout-minutes: 5
     steps:
-      - run: for i in 1 2 3; do curl -sSf -X POST "$BASE_URL/jobs/run-birthdays?token=$TOKEN" && break || sleep 5; done
+      - name: Trigger Birthday Calls
+        run: |
+          curl --fail --show-error --silent -X POST \
+          "https://gallant-reverence-production.up.railway.app/jobs/run-birthdays?token=${{ secrets.STATUS_TOKEN }}"
