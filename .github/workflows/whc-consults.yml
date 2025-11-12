@@ -1,25 +1,97 @@
 name: WHC - Consults (Sync + Reminders + Followups)
+
 on:
   schedule:
-    - cron: "2 14 * * *"   # 09:02 JA
-    - cron: "7 14 * * *"   # 09:07 JA
-    - cron: "12 14 * * *"  # 09:12 JA
+    # Jamaica 09:02 / 09:07 / 09:12  (UTC-5 → 14:02 / 14:07 / 14:12 UTC)
+    - cron: "2 14 * * *"
+    - cron: "7 14 * * *"
+    - cron: "12 14 * * *"
+    # If you want Mon–Fri only, change each to: "2 14 * * 1-5", etc.
   workflow_dispatch: {}
+
+# Prevent overlapping runs (e.g., manual + cron) for this workflow
+concurrency:
+  group: whc-consults
+  cancel-in-progress: true
+
 jobs:
   sync_consults:
+    name: Sync consults from Calendar → Sheet
     runs-on: ubuntu-latest
-    env: { BASE_URL: ${{ secrets.RAILWAY_BASE_URL }}, TOKEN: ${{ secrets.STATUS_TOKEN }} }
+    timeout-minutes: 10
+    env:
+      BASE_URL: ${{ secrets.RAILWAY_BASE_URL }}
+      TOKEN: ${{ secrets.STATUS_TOKEN }}
     steps:
-      - run: for i in 1 2 3; do curl -sSf -X POST "$BASE_URL/jobs/sync-consults?token=$TOKEN" && break || sleep 5; done
+      - name: Pre-check env
+        run: |
+          set -euo pipefail
+          [ -n "${BASE_URL:-}" ] || { echo "RAILWAY_BASE_URL is missing"; exit 1; }
+          [ -n "${TOKEN:-}" ] || { echo "STATUS_TOKEN is missing"; exit 1; }
+
+      - name: Health ping (optional)
+        run: |
+          set -euo pipefail
+          curl --fail --show-error --silent "${BASE_URL}/health" | grep -qi "ok"
+
+      - name: Status (optional)
+        run: |
+          set -euo pipefail
+          curl --fail --show-error --silent "${BASE_URL}/status.json?token=${TOKEN}" || true
+
+      - name: Sync consults
+        run: |
+          set -euo pipefail
+          # Endpoint must exist in server.js; change if you use a different path.
+          for i in 1 2 3; do
+            if curl --fail --show-error --silent -X POST \
+              "${BASE_URL}/jobs/sync-consults?token=${TOKEN}"; then
+              echo "Sync complete"; break
+            fi
+            echo "Sync failed (attempt $i). Retrying in 5s..."
+            sleep 5
+          done
+
   consult_reminders:
+    name: Consult reminders (7/3/1 days)
     runs-on: ubuntu-latest
     needs: sync_consults
-    env: { BASE_URL: ${{ secrets.RAILWAY_BASE_URL }}, TOKEN: ${{ secrets.STATUS_TOKEN }} }
+    timeout-minutes: 10
+    env:
+      BASE_URL: ${{ secrets.RAILWAY_BASE_URL }}
+      TOKEN: ${{ secrets.STATUS_TOKEN }}
     steps:
-      - run: for i in 1 2 3; do curl -sSf -X POST "$BASE_URL/jobs/run-consult-reminders?token=$TOKEN" && break || sleep 5; done
+      - name: Run reminders
+        run: |
+          set -euo pipefail
+          # If your server uses /jobs/run-consults instead, update the path.
+          for i in 1 2 3; do
+            if curl --fail --show-error --silent -X POST \
+              "${BASE_URL}/jobs/run-consult-reminders?token=${TOKEN}"; then
+              echo "Reminders complete"; break
+            fi
+            echo "Reminders failed (attempt $i). Retrying in 5s..."
+            sleep 5
+          done
+
   followups:
+    name: Post-visit follow-up calls
     runs-on: ubuntu-latest
     needs: sync_consults
-    env: { BASE_URL: ${{ secrets.RAILWAY_BASE_URL }}, TOKEN: ${{ secrets.STATUS_TOKEN }} }
+    timeout-minutes: 10
+    env:
+      BASE_URL: ${{ secrets.RAILWAY_BASE_URL }}
+      TOKEN: ${{ secrets.STATUS_TOKEN }}
     steps:
-      - run: for i in 1 2 3; do curl -sSf -X POST "$BASE_URL/jobs/run-followups?token=$TOKEN" && break || sleep 5; done
+      - name: Run followups
+        run: |
+          set -euo pipefail
+          # Ensure server exposes this path: /jobs/run-followups
+          for i in 1 2 3; do
+            if curl --fail --show-error --silent -X POST \
+              "${BASE_URL}/jobs/run-followups?token=${TOKEN}"; then
+              echo "Followups complete"; break
+            fi
+            echo "Followups failed (attempt $i). Retrying in 5s..."
+            sleep 5
+          done
