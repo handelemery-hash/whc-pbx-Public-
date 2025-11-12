@@ -2,16 +2,49 @@ name: WHC – Birthdays (Daily Calls)
 
 on:
   schedule:
-    # Daily 9:00 AM Jamaica time (UTC-5 = 14:00 UTC)
-    - cron: '0 14 * * *'
-  workflow_dispatch:   # Enables manual Run button
+    # Daily 9:00 AM Jamaica time (UTC-5 → 14:00 UTC)
+    - cron: "0 14 * * *"
+  workflow_dispatch: {}
+
+# Prevent overlapping runs (manual + cron)
+concurrency:
+  group: whc-birthdays
+  cancel-in-progress: true
 
 jobs:
   run-birthdays:
+    name: Birthday calls
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
+    env:
+      BASE_URL: ${{ secrets.RAILWAY_BASE_URL }}
+      TOKEN:    ${{ secrets.STATUS_TOKEN }}
     steps:
+      - name: Pre-check env
+        run: |
+          set -euo pipefail
+          [ -n "${BASE_URL:-}" ] || { echo "RAILWAY_BASE_URL secret is missing"; exit 1; }
+          [ -n "${TOKEN:-}" ]    || { echo "STATUS_TOKEN secret is missing"; exit 1; }
+
+      - name: Health ping
+        run: |
+          set -euo pipefail
+          curl --fail --show-error --silent "${BASE_URL}/health" | grep -qi "ok"
+
+      - name: Status check (optional)
+        run: |
+          set -euo pipefail
+          curl --fail --show-error --silent "${BASE_URL}/status.json?token=${TOKEN}" || true
+
       - name: Trigger Birthday Calls
         run: |
-          curl --fail --show-error --silent -X POST \
-          "https://gallant-reverence-production.up.railway.app/jobs/run-birthdays?token=${{ secrets.STATUS_TOKEN }}"
+          set -euo pipefail
+          # Retries 3x with 5s backoff
+          for i in 1 2 3; do
+            if curl --fail --show-error --silent -X POST \
+              "${BASE_URL}/jobs/run-birthdays?token=${TOKEN}"; then
+              echo "Birthday job complete"; break
+            fi
+            echo "Birthday job failed (attempt $i). Retrying in 5s..."
+            sleep 5
+          done
