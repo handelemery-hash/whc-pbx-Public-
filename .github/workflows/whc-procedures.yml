@@ -2,35 +2,71 @@ name: WHC - Procedures (Sync + Reminders)
 
 on:
   schedule:
-    # Runs daily at 09:00 Jamaica time (UTC-5 → 14:00 UTC)
+    # Daily at 09:00 Jamaica (UTC-5 → 14:00 UTC)
     - cron: "0 14 * * *"
+    # If you prefer Mon–Fri only, use:
+    # - cron: "0 14 * * 1-5"
   workflow_dispatch: {}
+
+# Prevent overlapping runs (manual + cron)
+concurrency:
+  group: whc-procedures
+  cancel-in-progress: true
 
 jobs:
   procedures:
     name: Sync then Remind
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     env:
       BASE_URL: ${{ secrets.RAILWAY_BASE_URL }}
       TOKEN: ${{ secrets.STATUS_TOKEN }}
-    steps:
-      - name: Health ping (optional)
-        run: |
-          curl -sS "${BASE_URL}/health" | grep -qi "ok"
 
-      - name: Status check (optional but helpful)
+    steps:
+      - name: Pre-check env
         run: |
-          curl -sS "${BASE_URL}/status.json?token=${TOKEN}" | jq .
+          set -euo pipefail
+          if [ -z "${BASE_URL:-}" ]; then
+            echo "RAILWAY_BASE_URL secret is missing"; exit 1
+          fi
+          if [ -z "${TOKEN:-}" ]; then
+            echo "STATUS_TOKEN secret is missing"; exit 1
+          fi
+
+      - name: Health ping
+        run: |
+          set -euo pipefail
+          curl --fail --show-error --silent "${BASE_URL}/health" | grep -qi "ok"
+
+      - name: Status check (optional)
+        run: |
+          set -euo pipefail
+          curl --fail --show-error --silent "${BASE_URL}/status.json?token=${TOKEN}" || true
 
       - name: Sync procedures from Google Calendar → Sheet
         run: |
+          set -euo pipefail
+          # Retries 3x with 5s backoff
           for i in 1 2 3; do
-            curl -sSf -X POST "${BASE_URL}/jobs/sync-procedures?token=${TOKEN}" && break || sleep 5
+            if curl --fail --show-error --silent -X POST \
+              "${BASE_URL}/jobs/sync-procedures?token=${TOKEN}"; then
+              echo "Sync complete"; break
+            fi
+            echo "Sync failed (attempt $i). Retrying in 5s..."
+            sleep 5
           done
 
       - name: Procedure reminders (7/3/1 days)
         run: |
+          set -euo pipefail
+          # Retries 3x with 5s backoff
+          # If your server exposes /jobs/run-procedures instead,
+          # replace the path below accordingly.
           for i in 1 2 3; do
-            curl -sSf -X POST "${BASE_URL}/jobs/run-procedure-reminders?token=${TOKEN}" && break || sleep 5
+            if curl --fail --show-error --silent -X POST \
+              "${BASE_URL}/jobs/run-procedure-reminders?token=${TOKEN}"; then
+              echo "Reminder job complete"; break
+            fi
+            echo "Reminders failed (attempt $i). Retrying in 5s..."
+            sleep 5
           done
